@@ -37,6 +37,7 @@ class FSWatcher:
             if p_resolved.is_file():
                 self._is_file_watch = True
                 self._file_targets.add(p_resolved)
+                self._file_targets.add(p_resolved.absolute())
                 self.paths.append(p_resolved.parent)
             else:
                 self.paths.append(p_resolved)
@@ -200,10 +201,10 @@ class FSWatcher:
     def _push_to_debounce(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
         # 0. If we are watching specific files, filter out events for other files in the parent directory
         if self._is_file_watch:
-            path_resolved = path.resolve()
-            dest_resolved = Path(dest_path).resolve() if dest_path else None
-            is_target = path_resolved in self._file_targets or \
-                        (dest_resolved and dest_resolved in self._file_targets)
+            path_abs = path.absolute()
+            dest_abs = Path(dest_path).absolute() if dest_path else None
+            is_target = path_abs in self._file_targets or \
+                        (dest_abs and dest_abs in self._file_targets)
             if not is_target:
                 return
 

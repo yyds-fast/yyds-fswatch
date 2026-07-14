@@ -8,7 +8,17 @@ from functools import lru_cache
 class GitIgnoreFilter:
     def __init__(self, root_paths: List[Path], use_gitignore: bool = True, ignore_patterns: List[str] = None):
         # We support multiple root paths, resolve them
+        # We support multiple root paths, resolve them
         self._roots = [p.resolve() for p in root_paths]
+        # Precompute string prefixes to avoid slow try-except relative_to checks
+        self._root_strs = []
+        for r in self._roots:
+            r_str = str(r)
+            if not r_str.endswith('/') and not r_str.endswith('\\'):
+                import os
+                r_str += os.sep
+            self._root_strs.append((r, r_str))
+
         self._fast_ignore_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".egg-info", "dist", "build"}
         self._compiled_rules = []
 
@@ -102,16 +112,16 @@ class GitIgnoreFilter:
             pass # Skip invalid regexes
 
     def _is_ignored_impl(self, path: Path, is_dir: bool = False) -> bool:
-        resolved_path = path.resolve()
+        # Avoid path.resolve() which hits the disk.
+        resolved_path = path.absolute()
+        resolved_path_str = str(resolved_path)
         
         # Determine the relative path to whichever root it belongs to
         rel_path = None
-        for root in self._roots:
-            try:
+        for root, root_str in self._root_strs:
+            if resolved_path_str.startswith(root_str) or resolved_path_str == root_str[:-1]:
                 rel_path = resolved_path.relative_to(root)
                 break
-            except ValueError:
-                continue
 
         if rel_path is None:
             # If not under any watched root, we don't watch it (ignore it)
