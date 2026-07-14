@@ -82,12 +82,8 @@ class WindowsWatcher(BaseWatcher):
         self._running = True
         for path in self.paths:
             path = path.resolve()
-            
-            # If path is a file, monitor its parent directory
-            watch_path = path if path.is_dir() else path.parent
-            
             hDir = CreateFileW(
-                str(watch_path),
+                str(path),
                 FILE_LIST_DIRECTORY,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
@@ -98,11 +94,11 @@ class WindowsWatcher(BaseWatcher):
             
             if hDir == INVALID_HANDLE_VALUE:
                 err = kernel32.GetLastError()
-                raise OSError(err, f"CreateFileW failed for {watch_path}: {ctypes.FormatError(err)}")
+                raise OSError(err, f"CreateFileW failed for {path}: {ctypes.FormatError(err)}")
                 
             self._handles.append(hDir)
             
-            t = threading.Thread(target=self._watch_handle, args=(hDir, watch_path, path.is_file()))
+            t = threading.Thread(target=self._watch_handle, args=(hDir, path))
             t.daemon = True
             t.start()
             self._threads.append(t)
@@ -117,7 +113,7 @@ class WindowsWatcher(BaseWatcher):
         self._handles.clear()
         self._threads.clear()
 
-    def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path, is_single_file: bool):
+    def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path):
         buf = ctypes.create_string_buffer(65536)
         bytes_returned = wintypes.DWORD(0)
         last_rename_old = None
@@ -150,13 +146,6 @@ class WindowsWatcher(BaseWatcher):
                 name = name_bytes.decode('utf-16le', errors='replace')
                 
                 event_path = watch_path / name
-                
-                # If we are only monitoring a single file, filter out other files
-                if is_single_file and event_path.name != watch_path.name:
-                    if next_offset == 0:
-                        break
-                    offset += next_offset
-                    continue
                 
                 is_dir = event_path.is_dir() if event_path.exists() else False
                 

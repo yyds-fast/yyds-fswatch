@@ -23,10 +23,25 @@ class FSWatcher:
     def __init__(self, path: Union[str, Path, List[Union[str, Path]], Tuple[Union[str, Path]]], 
                  recursive: bool = True, debounce: float = 0.05, 
                  use_gitignore: bool = True, ignore_patterns: List[str] = None):
+        self._is_file_watch = False
+        self._file_targets = set()
+        self.paths = []
+
         if isinstance(path, (str, Path)):
-            self.paths = [Path(path)]
+            raw_paths = [Path(path)]
         else:
-            self.paths = [Path(p) for p in path]
+            raw_paths = [Path(p) for p in path]
+
+        for p in raw_paths:
+            p_resolved = p.resolve()
+            if p_resolved.is_file():
+                self._is_file_watch = True
+                self._file_targets.add(p_resolved)
+                self.paths.append(p_resolved.parent)
+            else:
+                self.paths.append(p_resolved)
+
+        self.paths = list(dict.fromkeys(self.paths))
 
         self.recursive = recursive
         self.debounce = debounce
@@ -183,6 +198,15 @@ class FSWatcher:
         self._loop.call_soon_threadsafe(self._push_to_debounce, event_type, path, is_dir, dest_path)
 
     def _push_to_debounce(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
+        # 0. If we are watching specific files, filter out events for other files in the parent directory
+        if self._is_file_watch:
+            path_resolved = path.resolve()
+            dest_resolved = Path(dest_path).resolve() if dest_path else None
+            is_target = path_resolved in self._file_targets or \
+                        (dest_resolved and dest_resolved in self._file_targets)
+            if not is_target:
+                return
+
         # 1. Filter out ignored files/folders
         if self._ignore_filter and self._ignore_filter.is_ignored(path, is_dir):
             return

@@ -169,14 +169,17 @@ class LinuxWatcher(BaseWatcher):
             self._path_to_wd[dir_path] = wd
 
     def _handle_raw_read(self):
-        try:
-            data = os.read(self._fd, 4096)
-        except BlockingIOError:
-            return
-        except OSError:
-            return
+        while True:
+            try:
+                data = os.read(self._fd, 65536)
+                if not data:
+                    break
+                self._buffer += data
+            except BlockingIOError:
+                break
+            except OSError:
+                return
 
-        self._buffer += data
         offset = 0
         header_size = 16  # wd(4) + mask(4) + cookie(4) + len(4)
 
@@ -245,6 +248,24 @@ class LinuxWatcher(BaseWatcher):
             if cookie in self._move_cookies:
                 old_path, _, _ = self._move_cookies.pop(cookie)
                 self.on_raw_event("moved", old_path, is_dir, dest_path=event_path)
+                
+                # Update watch mappings recursively for directory renames
+                if is_dir:
+                    if old_path in self._path_to_wd:
+                        wd = self._path_to_wd.pop(old_path)
+                        self._path_to_wd[event_path] = wd
+                        self._wd_to_path[wd] = event_path
+                        
+                    if self.recursive:
+                        for path in list(self._path_to_wd.keys()):
+                            try:
+                                rel_path = path.relative_to(old_path)
+                                new_sub_path = event_path / rel_path
+                                wd = self._path_to_wd.pop(path)
+                                self._path_to_wd[new_sub_path] = wd
+                                self._wd_to_path[wd] = new_sub_path
+                            except ValueError:
+                                continue
             else:
                 # Treat as created if no matching cookie
                 if is_dir and self.recursive:
