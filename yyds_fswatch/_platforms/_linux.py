@@ -200,6 +200,11 @@ class LinuxWatcher(BaseWatcher):
         self._buffer = self._buffer[offset:]
 
     def _dispatch_event(self, wd: int, mask: int, cookie: int, name: str):
+        if mask & InotifyMask.IN_Q_OVERFLOW:
+            root_path = self.paths[0] if self.paths else Path('.')
+            self.on_raw_event("overflow", root_path, is_dir=False)
+            return
+
         dir_path = self._wd_to_path.get(wd)
         if not dir_path:
             return

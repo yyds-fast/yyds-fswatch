@@ -112,6 +112,9 @@ class FSWatcher:
             self._bg_thread.join(timeout=2.0)
         # Put final sentinel just in case
         self._sync_queue.put(_STOP_SENTINEL)
+        if self._ignore_filter:
+            self._ignore_filter.close()
+            self._ignore_filter = None
 
     def _run_bg_loop(self):
         self._bg_loop = asyncio.new_event_loop()
@@ -150,6 +153,7 @@ class FSWatcher:
     async def __aenter__(self):
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue()
+        self._recovery_task = None
         
         # Load Ignore rules
         self._ignore_filter = GitIgnoreFilter(self.paths, self.use_gitignore, self.ignore_patterns)
@@ -166,11 +170,25 @@ class FSWatcher:
             ignore_filter=self._ignore_filter
         )
         
-        self._watcher.start()
+        any_missing = any(not p.exists() for p in self.paths)
+        if not any_missing:
+            self._watcher.start()
+            
         self.is_ready = True
+        self._recovery_task = self._loop.create_task(self._recovery_loop())
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.is_ready = False
+        
+        if self._recovery_task:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
+
         # Stop background platform monitoring
         for timer in self._pending_timers.values():
             timer.cancel()
@@ -181,8 +199,38 @@ class FSWatcher:
             self._watcher.stop()
             self._watcher = None
 
-        self.is_ready = False
+        if self._ignore_filter:
+            self._ignore_filter.close()
+            self._ignore_filter = None
+
         self._queue.put_nowait(_STOP_SENTINEL)
+
+    async def _recovery_loop(self):
+        any_missing = any(not p.exists() for p in self.paths)
+        watcher_running = not any_missing
+        
+        while self.is_ready:
+            try:
+                await asyncio.sleep(2.0)
+                if not self.is_ready:
+                    break
+                any_missing = any(not p.exists() for p in self.paths)
+                
+                if any_missing and watcher_running:
+                    if self._watcher:
+                        self._watcher.stop()
+                    watcher_running = False
+                elif not any_missing and not watcher_running:
+                    if self._watcher:
+                        try:
+                            self._watcher.start()
+                            watcher_running = True
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     def __aiter__(self):
         return self
@@ -199,6 +247,20 @@ class FSWatcher:
         self._loop.call_soon_threadsafe(self._push_to_debounce, event_type, path, is_dir, dest_path)
 
     def _push_to_debounce(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
+        if event_type == "overflow":
+            # Flush all pending events first to preserve order
+            for p in list(self._pending_events.keys()):
+                self._flush_event(p)
+            
+            # Emit overflow event immediately
+            event = FSEvent(
+                event_type="overflow",
+                src_path=str(path),
+                is_directory=False
+            )
+            self._emit_event(event)
+            return
+
         # 0. If we are watching specific files, filter out events for other files in the parent directory
         if self._is_file_watch:
             path_abs = path.absolute()

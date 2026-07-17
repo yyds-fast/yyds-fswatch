@@ -70,18 +70,78 @@ CloseHandle.restype = wintypes.BOOL
 class WindowsWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
                  on_raw_event: Callable, ignore_filter=None):
-        # We need to import asyncio inside methods to ensure compatibility
         import asyncio
         super().__init__(paths, recursive, loop, on_raw_event)
         self._ignore_filter = ignore_filter
         self._handles: List[wintypes.HANDLE] = []
         self._threads: List[threading.Thread] = []
         self._running = False
+        self._directory_paths = set()
+        self._dir_lock = threading.Lock()
+
+    def _add_directory_recursive_to_set(self, path: Path):
+        with self._dir_lock:
+            self._directory_paths.add(path)
+            self._directory_paths.add(path.absolute())
+        
+        if self.recursive:
+            try:
+                for root, dirs, files in os.walk(path):
+                    for d in dirs:
+                        dir_path = Path(root) / d
+                        with self._dir_lock:
+                            self._directory_paths.add(dir_path)
+                            self._directory_paths.add(dir_path.absolute())
+            except Exception:
+                pass
+
+    def _remove_directory_from_set(self, path: Path):
+        path_abs = path.absolute()
+        with self._dir_lock:
+            self._directory_paths.discard(path)
+            self._directory_paths.discard(path_abs)
+            to_remove = [p for p in self._directory_paths if p.parts[:len(path_abs.parts)] == path_abs.parts]
+            for p in to_remove:
+                self._directory_paths.discard(p)
+
+    def _rename_directory_in_set(self, old_path: Path, new_path: Path):
+        old_abs = old_path.absolute()
+        new_abs = new_path.absolute()
+        with self._dir_lock:
+            subdirs = []
+            for p in self._directory_paths:
+                try:
+                    rel = p.relative_to(old_abs)
+                    subdirs.append((p, new_abs / rel))
+                except ValueError:
+                    pass
+                try:
+                    rel = p.relative_to(old_path)
+                    subdirs.append((p, new_path / rel))
+                except ValueError:
+                    pass
+            
+            for old_p, new_p in subdirs:
+                self._directory_paths.discard(old_p)
+                self._directory_paths.add(new_p)
+                self._directory_paths.add(new_p.absolute())
+            
+            self._directory_paths.discard(old_path)
+            self._directory_paths.discard(old_abs)
+            self._directory_paths.add(new_path)
+            self._directory_paths.add(new_abs)
+
+    def _is_path_directory(self, path: Path) -> bool:
+        with self._dir_lock:
+            return path in self._directory_paths or path.absolute() in self._directory_paths
 
     def start(self):
         self._running = True
         for path in self.paths:
             path = path.resolve()
+            if path.is_dir():
+                self._add_directory_recursive_to_set(path)
+                
             hDir = CreateFileW(
                 str(path),
                 FILE_LIST_DIRECTORY,
@@ -116,7 +176,10 @@ class WindowsWatcher(BaseWatcher):
     def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path):
         buf = ctypes.create_string_buffer(65536)
         bytes_returned = wintypes.DWORD(0)
-        last_rename_old = None
+
+        # Win32 Error codes for overflow detection
+        ERROR_MORE_DATA = 234
+        ERROR_NOTIFY_ENUM_DIR = 1022
 
         while self._running:
             success = ReadDirectoryChangesW(
@@ -130,9 +193,23 @@ class WindowsWatcher(BaseWatcher):
                 None
             )
             
-            if not success or not self._running:
-                break
-                
+            if not success:
+                if not self._running:
+                    break
+                err = kernel32.GetLastError()
+                if err in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
+                    # Buffer overflow occurred
+                    self.on_raw_event("overflow", watch_path, is_dir=False)
+                    continue
+                else:
+                    break
+            
+            if bytes_returned.value == 0:
+                # Buffer overflow occurred (ReadDirectoryChangesW returns success but 0 bytes)
+                self.on_raw_event("overflow", watch_path, is_dir=False)
+                continue
+
+            events_in_packet = []
             offset = 0
             while True:
                 if offset + 12 > bytes_returned.value:
@@ -146,25 +223,46 @@ class WindowsWatcher(BaseWatcher):
                 name = name_bytes.decode('utf-16le', errors='replace')
                 
                 event_path = watch_path / name
-                
-                is_dir = event_path.is_dir() if event_path.exists() else False
-                
-                if action == 1: # ADDED
-                    self.on_raw_event("created", event_path, is_dir)
-                elif action == 2: # REMOVED
-                    self.on_raw_event("deleted", event_path, is_dir)
-                elif action == 3: # MODIFIED
-                    self.on_raw_event("modified", event_path, is_dir)
-                elif action == 4: # RENAMED_OLD_NAME
-                    last_rename_old = (event_path, is_dir)
-                elif action == 5: # RENAMED_NEW_NAME
-                    if last_rename_old:
-                        old_path, old_is_dir = last_rename_old
-                        self.on_raw_event("moved", old_path, old_is_dir, dest_path=event_path)
-                        last_rename_old = None
-                    else:
-                        self.on_raw_event("created", event_path, is_dir)
+                events_in_packet.append((action, event_path))
                 
                 if next_offset == 0:
                     break
                 offset += next_offset
+
+            i = 0
+            n = len(events_in_packet)
+            while i < n:
+                action, event_path = events_in_packet[i]
+                
+                if action == 4: # RENAMED_OLD_NAME
+                    if i + 1 < n and events_in_packet[i+1][0] == 5:
+                        next_action, next_path = events_in_packet[i+1]
+                        is_dir = self._is_path_directory(event_path)
+                        if is_dir:
+                            self._rename_directory_in_set(event_path, next_path)
+                        self.on_raw_event("moved", event_path, is_dir, dest_path=next_path)
+                        i += 2
+                    else:
+                        is_dir = self._is_path_directory(event_path)
+                        self.on_raw_event("deleted", event_path, is_dir)
+                        i += 1
+                elif action == 5: # RENAMED_NEW_NAME
+                    is_dir = event_path.is_dir() if event_path.exists() else False
+                    if is_dir:
+                        self._add_directory_recursive_to_set(event_path)
+                    self.on_raw_event("created", event_path, is_dir)
+                    i += 1
+                elif action == 1: # ADDED
+                    is_dir = event_path.is_dir() if event_path.exists() else False
+                    if is_dir:
+                        self._add_directory_recursive_to_set(event_path)
+                    self.on_raw_event("created", event_path, is_dir)
+                elif action == 2: # REMOVED
+                    is_dir = self._is_path_directory(event_path)
+                    self._remove_directory_from_set(event_path)
+                    self.on_raw_event("deleted", event_path, is_dir)
+                elif action == 3: # MODIFIED
+                    is_dir = event_path.is_dir() if event_path.exists() else False
+                    self.on_raw_event("modified", event_path, is_dir)
+                else:
+                    i += 1

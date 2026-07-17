@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 @dataclass
 class FSEvent:
-    event_type: str         # 'created' | 'modified' | 'deleted' | 'moved'
-    src_path: str           # absolute path of source
+    event_type: str         # 'created' | 'modified' | 'deleted' | 'moved' | 'overflow'
+    src_path: str           # absolute path of source (empty string or root directory for 'overflow')
     dest_path: str = ""     # absolute path of destination (only for 'moved')
     is_directory: bool = False
 
