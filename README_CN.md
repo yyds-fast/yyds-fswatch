@@ -107,36 +107,6 @@ asyncio.run(main())
 
 ---
 
-## 💻 命令行工具 (CLI)
-
-`yyds-fswatch` 内置了开箱即用的命令行查看工具，带有炫酷的色彩和格式化输出。
-
-### 运行方式
-```bash
-# 监控当前目录
-yyds-fswatch .
-
-# 监控指定目录并启用递归，设置防抖为 100ms
-yyds-fswatch /path/to/project --recursive --debounce 0.1
-
-# 禁用 .gitignore 过滤
-yyds-fswatch . --no-gitignore
-```
-
-### 示例输出
-```text
-yyds-fswatch v0.1.0 starting up...
-Watching paths: /home/user/project
-Options: recursive=True, debounce=0.05s, gitignore=True
-Press Ctrl+C to stop.
-
-[09:15:20] CREATED  /home/user/project/new_file.py
-[09:15:20] MODIFIED /home/user/project/new_file.py
-[09:15:24] MOVED    /home/user/project/new_file.py -> /home/user/project/archived.py
-[09:15:30] DELETED  /home/user/project/archived.py
-```
-
----
 
 ## 🛡️ 深度技术优化细节
 

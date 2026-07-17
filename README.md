@@ -109,36 +109,6 @@ asyncio.run(main())
 
 ---
 
-## 💻 Command Line Interface (CLI)
-
-`yyds-fswatch` provides a command-line tool with rich-colored logging output out of the box.
-
-### Usage
-```bash
-# Watch the current directory
-yyds-fswatch .
-
-# Watch a specific path recursively with 100ms debounce
-yyds-fswatch /path/to/project --recursive --debounce 0.1
-
-# Disable .gitignore filtering
-yyds-fswatch . --no-gitignore
-```
-
-### Example Output
-```text
-yyds-fswatch v0.1.0 starting up...
-Watching paths: /home/user/project
-Options: recursive=True, debounce=0.05s, gitignore=True
-Press Ctrl+C to stop.
-
-[09:15:20] CREATED  /home/user/project/new_file.py
-[09:15:20] MODIFIED /home/user/project/new_file.py
-[09:15:24] MOVED    /home/user/project/new_file.py -> /home/user/project/archived.py
-[09:15:30] DELETED  /home/user/project/archived.py
-```
-
----
 
 ## 🛡️ Deep Technical Optimization Details
 

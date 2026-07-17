@@ -99,7 +99,6 @@ yyds_fswatch/
 ├── events.py            # FSEvent 定义
 ├── watcher.py           # FSWatcher 核心类（防抖 + 4种模式 + 哨兵退出）
 ├── ignore.py            # .gitignore 解析与过滤引擎（支持 LRU 缓存）
-├── cli.py               # CLI 入口 (click + rich)
 └── _platforms/
     ├── __init__.py      # 平台自动选择工厂
     ├── _base.py         # 抽象基类
@@ -554,7 +553,7 @@ async def __anext__(self) -> FSEvent:
 
 | 阶段 | 交付内容 |
 | :--- | :--- |
-| **Phase 1** | `events.py` + `ignore.py` + `_base.py` + `_linux.py` + `watcher.py`（4种模式） + `__init__.py` + `__version__.py` + `cli.py` |
+| **Phase 1** | `events.py` + `ignore.py` + `_base.py` + `_linux.py` + `watcher.py`（4种模式） + `__init__.py` + `__version__.py` |
 | **Phase 2** | `_polling.py`（降级方案） |
 | **Phase 3** | `_windows.py` + `_darwin.py` |
 

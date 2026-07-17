@@ -37,14 +37,5 @@ setup(
         "Operating System :: OS Independent",
         "License :: OSI Approved :: MIT License",
     ],
-    install_requires=[
-        "click>=8.0.0",
-        "rich>=12.0.0",
-    ],
-    entry_points={
-        "console_scripts": [
-            "yyds-fswatch = yyds_fswatch.cli:main",
-            "yyds_fswatch = yyds_fswatch.cli:main",
-        ]
-    },
+    install_requires=[],
 )
