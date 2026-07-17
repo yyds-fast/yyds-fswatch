@@ -15,8 +15,10 @@
 | **Linux Performance** | **Zero additional threads** (ctypes non-blocking `inotify` + `loop.add_reader`) | Starts an independent Python blocking thread for each Emitter |
 | **Atomic Save Support** | **$100\%$ compatible**. File watches automatically fall back to parent directory + top-level filter | Direct file watching fails and loses watch handle upon Vim/VSCode atomic saves |
 | **Debounce & Coalesce** | Built-in 50ms sliding window state machine | No debouncing; saving one file triggers dozens of redundant `modified` events |
-| **GitIgnore Pruning** | Automatically parses `.gitignore` and **prunes the watch tree** at registration, avoiding ENOSPC | No automatic pruning; watching large repos (e.g. `node_modules`) easily exhausts descriptors |
-| **Rename Sync** | Strong cookie pairing. Automatically synchronizes path mappings for renamed subdirectories | Subdirectory path mappings can get out of sync, reporting stale paths for subsequent events |
+| **GitIgnore Pruning** | Parses root and **nested `.gitignore`** dynamically, pruning directories at registration | No nested parsing/pruning; large repos easily exhaust descriptors |
+| **Rename Sync** | Robust transaction-packet & cookie pairing. Automatically updates subdirectory path mappings | Subdirectory path mappings get out of sync, reporting stale paths for events |
+| **Overflow Resilience** | **Supported**. Emits an `overflow` event when system buffers are saturated, continuing normally | **Unsupported**. Misses events silently or crashes the watch thread |
+| **Root Self-Healing** | **Supported**. Pauses and polls when root directories are deleted/unmounted, auto-recovering | **Unsupported**. Crashes with FileNotFoundError or terminates silently |
 
 ---
 
@@ -142,7 +144,10 @@ Press Ctrl+C to stop.
 
 1. **Atomic Save Filtering**: For file watches (e.g. `data.json`), the system automatically monitors its parent directory and intercepts `MOVED_TO` and `CREATE` events. It filters out intermediate temporary files, guaranteeing that updates are $100\%$ captured regardless of the editor's write mechanism.
 2. **High-Performance Prefix Matching**: Bypasses the expensive `try-except ValueError` and `Path.resolve()` system calls during event filtering. Uses in-memory absolute path checks and precomputed string prefix matching to achieve a throughput of over **100,000 checks per second**.
-3. **Graceful Lifecycle Management**: When exiting `async for` loops or catching `KeyboardInterrupt`, the library automatically pushes a `_STOP_SENTINEL` to cleanly close async event queue hooks, preventing coroutine or thread leaks.
+3. **Robust Lifecycle & Memory Safety**: When exiting standard/async loops or catching `KeyboardInterrupt`, the library cleanly shuts down async event queue hooks. Additionally, a `close()` mechanism is provided to purge the ignore filter's LRU cache and break cyclic references, allowing Python's GC to immediately collect resources.
+4. **System Buffer Overflow Prevention (Overflow Event)**: Under extreme file system activity, OS event queues can saturate (Linux `IN_Q_OVERFLOW` / Windows `ERROR_MORE_DATA`). The watcher handles these gracefully by emitting an `"overflow"` event and continuing monitoring, preventing locks or crash loops.
+5. **Hierarchical Nested `.gitignore` Support**: Automatically traverses and dynamically parses `.gitignore` files nested at any subdirectory depth, creating parent-child regex associations for precise, Git-compliant tree pruning.
+6. **Self-Healing Root Recovery**: If a watched root directory is deleted or unmounted, the watcher pauses native OS watches and falls back to a low-overhead retry loop. Monitoring is automatically re-established the moment the path reappears.
 
 ---
 
