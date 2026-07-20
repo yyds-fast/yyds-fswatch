@@ -3,13 +3,14 @@ import sys
 if sys.platform != "win32":
     raise ImportError("Windows only")
 
+import asyncio
 import ctypes
 from ctypes import wintypes
 import os
 import struct
 import threading
 from pathlib import Path
-from typing import List, Callable, Dict
+from typing import List, Callable
 
 from ._base import BaseWatcher
 
@@ -70,19 +71,25 @@ CloseHandle.restype = wintypes.BOOL
 class WindowsWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
                  on_raw_event: Callable, ignore_filter=None):
-        import asyncio
         super().__init__(paths, recursive, loop, on_raw_event)
         self._ignore_filter = ignore_filter
         self._handles: List[wintypes.HANDLE] = []
         self._threads: List[threading.Thread] = []
         self._running = False
+        self._stop_event = threading.Event()
         self._directory_paths = set()
         self._dir_lock = threading.Lock()
 
+    @property
+    def is_running(self) -> bool:
+        return self._running and bool(self._threads) and all(
+            thread.is_alive() for thread in self._threads
+        )
+
     def _add_directory_recursive_to_set(self, path: Path):
+        path = path.absolute()
         with self._dir_lock:
             self._directory_paths.add(path)
-            self._directory_paths.add(path.absolute())
         
         if self.recursive:
             try:
@@ -90,7 +97,6 @@ class WindowsWatcher(BaseWatcher):
                     for d in dirs:
                         dir_path = Path(root) / d
                         with self._dir_lock:
-                            self._directory_paths.add(dir_path)
                             self._directory_paths.add(dir_path.absolute())
             except Exception:
                 pass
@@ -98,9 +104,14 @@ class WindowsWatcher(BaseWatcher):
     def _remove_directory_from_set(self, path: Path):
         path_abs = path.absolute()
         with self._dir_lock:
-            self._directory_paths.discard(path)
             self._directory_paths.discard(path_abs)
-            to_remove = [p for p in self._directory_paths if p.parts[:len(path_abs.parts)] == path_abs.parts]
+            to_remove = []
+            for directory in self._directory_paths:
+                try:
+                    directory.relative_to(path_abs)
+                except ValueError:
+                    continue
+                to_remove.append(directory)
             for p in to_remove:
                 self._directory_paths.discard(p)
 
@@ -114,57 +125,64 @@ class WindowsWatcher(BaseWatcher):
                     rel = p.relative_to(old_abs)
                     subdirs.append((p, new_abs / rel))
                 except ValueError:
-                    pass
-                try:
-                    rel = p.relative_to(old_path)
-                    subdirs.append((p, new_path / rel))
-                except ValueError:
-                    pass
+                    continue
             
             for old_p, new_p in subdirs:
                 self._directory_paths.discard(old_p)
                 self._directory_paths.add(new_p)
-                self._directory_paths.add(new_p.absolute())
             
-            self._directory_paths.discard(old_path)
             self._directory_paths.discard(old_abs)
-            self._directory_paths.add(new_path)
             self._directory_paths.add(new_abs)
 
     def _is_path_directory(self, path: Path) -> bool:
         with self._dir_lock:
-            return path in self._directory_paths or path.absolute() in self._directory_paths
+            return path.absolute() in self._directory_paths
 
     def start(self):
+        if self._running:
+            raise RuntimeError("Windows watcher is already running")
         self._running = True
-        for path in self.paths:
-            path = path.resolve()
-            if path.is_dir():
-                self._add_directory_recursive_to_set(path)
-                
-            hDir = CreateFileW(
-                str(path),
-                FILE_LIST_DIRECTORY,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                None
-            )
-            
-            if hDir == INVALID_HANDLE_VALUE:
-                err = kernel32.GetLastError()
-                raise OSError(err, f"CreateFileW failed for {path}: {ctypes.FormatError(err)}")
-                
-            self._handles.append(hDir)
-            
-            t = threading.Thread(target=self._watch_handle, args=(hDir, path))
-            t.daemon = True
-            t.start()
-            self._threads.append(t)
+        self._stop_event = threading.Event()
+        self._directory_paths.clear()
+        try:
+            for path in self.paths:
+                path = path.resolve()
+                if not path.exists():
+                    continue
+                if path.is_dir():
+                    self._add_directory_recursive_to_set(path)
+
+                hDir = CreateFileW(
+                    str(path),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None
+                )
+
+                if hDir == INVALID_HANDLE_VALUE:
+                    err = kernel32.GetLastError()
+                    raise OSError(err, f"CreateFileW failed for {path}: {ctypes.FormatError(err)}")
+
+                self._handles.append(hDir)
+
+                thread = threading.Thread(
+                    target=self._watch_handle,
+                    args=(hDir, path, self._stop_event),
+                    name=f"yyds-fswatch:{path}",
+                    daemon=True,
+                )
+                thread.start()
+                self._threads.append(thread)
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self):
         self._running = False
+        self._stop_event.set()
         for h in self._handles:
             if h != INVALID_HANDLE_VALUE:
                 CloseHandle(h)
@@ -172,8 +190,11 @@ class WindowsWatcher(BaseWatcher):
             t.join(timeout=1.0)
         self._handles.clear()
         self._threads.clear()
+        with self._dir_lock:
+            self._directory_paths.clear()
 
-    def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path):
+    def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path,
+                      stop_event: threading.Event):
         buf = ctypes.create_string_buffer(65536)
         bytes_returned = wintypes.DWORD(0)
 
@@ -181,7 +202,7 @@ class WindowsWatcher(BaseWatcher):
         ERROR_MORE_DATA = 234
         ERROR_NOTIFY_ENUM_DIR = 1022
 
-        while self._running:
+        while not stop_event.is_set():
             success = ReadDirectoryChangesW(
                 hDir,
                 buf,
@@ -194,7 +215,7 @@ class WindowsWatcher(BaseWatcher):
             )
             
             if not success:
-                if not self._running:
+                if stop_event.is_set():
                     break
                 err = kernel32.GetLastError()
                 if err in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
@@ -202,6 +223,20 @@ class WindowsWatcher(BaseWatcher):
                     self.on_raw_event("overflow", watch_path, is_dir=False)
                     continue
                 else:
+                    exception = OSError(
+                        err,
+                        f"ReadDirectoryChangesW failed for {watch_path}: {ctypes.FormatError(err)}",
+                    )
+                    try:
+                        self.loop.call_soon_threadsafe(
+                            self.loop.call_exception_handler,
+                            {
+                                "message": "yyds-fswatch Windows backend failed",
+                                "exception": exception,
+                            },
+                        )
+                    except RuntimeError:
+                        pass
                     break
             
             if bytes_returned.value == 0:
@@ -257,12 +292,15 @@ class WindowsWatcher(BaseWatcher):
                     if is_dir:
                         self._add_directory_recursive_to_set(event_path)
                     self.on_raw_event("created", event_path, is_dir)
+                    i += 1
                 elif action == 2: # REMOVED
                     is_dir = self._is_path_directory(event_path)
                     self._remove_directory_from_set(event_path)
                     self.on_raw_event("deleted", event_path, is_dir)
+                    i += 1
                 elif action == 3: # MODIFIED
                     is_dir = event_path.is_dir() if event_path.exists() else False
                     self.on_raw_event("modified", event_path, is_dir)
+                    i += 1
                 else:
                     i += 1

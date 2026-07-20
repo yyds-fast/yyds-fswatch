@@ -4,7 +4,6 @@ import unittest
 import tempfile
 import shutil
 import time
-import os
 from pathlib import Path
 from yyds_fswatch import FSWatcher
 
@@ -25,6 +24,8 @@ class TestFSWatcherFileWatch(unittest.TestCase):
         # Monitor ONLY the target file
         watcher = FSWatcher(self.target_file, debounce=0.05)
         events = []
+        import threading
+        changes_done = threading.Event()
 
         def perform_changes():
             # Wait for watcher to start
@@ -54,8 +55,8 @@ class TestFSWatcherFileWatch(unittest.TestCase):
             # 4. Delete target file
             self.target_file.unlink()
             time.sleep(0.2)
+            changes_done.set()
 
-        import threading
         t = threading.Thread(target=perform_changes)
         t.start()
 
@@ -72,6 +73,8 @@ class TestFSWatcherFileWatch(unittest.TestCase):
                         break
                     events.append(event)
                 except queue.Empty:
+                    if changes_done.is_set():
+                        break
                     continue
 
         t.join()

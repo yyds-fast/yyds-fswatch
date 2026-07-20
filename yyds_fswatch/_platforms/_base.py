@@ -16,3 +16,7 @@ class BaseWatcher:
 
     def stop(self):
         raise NotImplementedError
+
+    @property
+    def is_running(self) -> bool:
+        return False

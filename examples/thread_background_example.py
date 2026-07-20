@@ -41,17 +41,13 @@ class FileWatcherPlugin:
         self.watch_thread = threading.Thread(target=self.watcher.start)
         self.watch_thread.daemon = True
         self.watch_thread.start()
+        self.watcher.wait_until_ready(timeout=5.0)
         print("yyds-fswatch 已在后台守护线程中启动。")
 
     def stop_watch(self):
         """停止 yyds-fswatch"""
         if hasattr(self, 'watcher') and self.watcher and self.watcher.is_ready:
-            # 优雅通知 asyncio 事件循环退出
-            if self.watcher._loop:
-                from yyds_fswatch.watcher import _STOP_SENTINEL
-                self.watcher._loop.call_soon_threadsafe(
-                    lambda: self.watcher._queue.put_nowait(_STOP_SENTINEL)
-                )
+            self.watcher.stop()
             self.watch_thread.join(timeout=1.0)
             print("yyds-fswatch 已停止。")
         else:

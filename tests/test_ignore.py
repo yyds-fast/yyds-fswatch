@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import unittest
+import tempfile
 from pathlib import Path
 from yyds_fswatch.ignore import GitIgnoreFilter
 
@@ -36,6 +37,7 @@ class TestGitIgnoreFilter(unittest.TestCase):
         
         # 4. build file should NOT be ignored because build/ is directory-only
         self.assertFalse(filt.is_ignored(self.temp_dir / "build", is_dir=False))
+        self.assertTrue(filt.is_ignored(self.temp_dir / "build" / "artifact.bin", is_dir=False))
 
         # 5. /dist should only be ignored at root
         self.assertTrue(filt.is_ignored(self.temp_dir / "dist"))
@@ -60,6 +62,39 @@ class TestGitIgnoreFilter(unittest.TestCase):
         info = filt.is_ignored.cache_info()
         self.assertEqual(info.hits, 1)
         self.assertEqual(info.misses, 1)
+
+    def test_dynamic_gitignore_invalidation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            filt = GitIgnoreFilter(
+                root_paths=[root],
+                use_gitignore=True,
+                ignore_common_dirs=False,
+            )
+            target = root / "dynamic.log"
+            self.assertFalse(filt.is_ignored(target))
+
+            gitignore = root / ".gitignore"
+            gitignore.write_text("*.log\n", encoding="utf-8")
+            filt.notify_event("created", gitignore, False)
+            self.assertTrue(filt.is_ignored(target))
+
+            gitignore.write_text("*.tmp\n", encoding="utf-8")
+            filt.notify_event("modified", gitignore, False)
+            self.assertFalse(filt.is_ignored(target))
+            filt.close()
+
+    def test_common_directory_filter_can_be_disabled(self):
+        enabled = GitIgnoreFilter([self.temp_dir], use_gitignore=False)
+        disabled = GitIgnoreFilter(
+            [self.temp_dir],
+            use_gitignore=False,
+            ignore_common_dirs=False,
+        )
+        artifact = self.temp_dir / "dist" / "artifact.whl"
+
+        self.assertTrue(enabled.is_ignored(artifact))
+        self.assertFalse(disabled.is_ignored(artifact))
 
 if __name__ == "__main__":
     unittest.main()

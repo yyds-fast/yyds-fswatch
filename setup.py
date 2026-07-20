@@ -10,7 +10,7 @@ here = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(here, "yyds_fswatch", "__version__.py"), "r", "utf-8") as f:
     exec(f.read(), about)
 
-with open("README.md", "r", encoding="utf-8") as fh:
+with open(os.path.join(here, "README.md"), "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
@@ -23,8 +23,9 @@ setup(
     long_description_content_type="text/markdown",
     url=about["__url__"],
     license=about.get("__license__", "MIT"),
-    packages=find_packages(),
+    packages=find_packages(exclude=("tests", "tests.*")),
     include_package_data=True,
+    license_files=["LICENSE"],
     python_requires='>=3.7',
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -35,7 +36,6 @@ setup(
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Operating System :: OS Independent",
-        "License :: OSI Approved :: MIT License",
     ],
     install_requires=[],
 )

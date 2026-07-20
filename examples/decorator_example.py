@@ -5,7 +5,6 @@ This script demonstrates how to monitor a directory using decorators.
 """
 
 import os
-import time
 from yyds_fswatch import FSWatcher
 
 def main():
@@ -38,10 +37,8 @@ def main():
         # This will be called for any event type
         pass
 
-    try:
-        w.start()
-    except KeyboardInterrupt:
-        print("\nStopping watcher...")
+    w.start()
+    print("\nWatcher stopped.")
 
 if __name__ == "__main__":
     main()

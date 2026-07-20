@@ -9,4 +9,7 @@ __all__ = [
     "FSEvent",
     "watch",
     "__version__",
+    "__title__",
+    "__author__",
+    "__license__",
 ]

@@ -1,6 +1,6 @@
 # 🚀 yyds-fswatch
 
-`yyds-fswatch` 是一个专为现代 Python 设计的**高性能、原生异步（asyncio）、对开发者极其友好**的文件系统监听库。它旨在完全代替并超越传统的 `watchdog` 库。
+`yyds-fswatch` 是一个面向现代 Python 的轻量级、asyncio 友好文件系统监听库。它提供比 Observer/Handler 更紧凑的 API，并让平台降级行为保持可见。
 
 ---
 
@@ -11,12 +11,12 @@
 | **API 易用性** | 渐进式 4 层 API（装饰器 / 回调 / 同步迭代 / 异步迭代） | 繁琐的 Observer + Handler 类继承体系 |
 | **异步集成** | **原生协程支持** (`async with` 和 `async for`) | 需要自行使用线程池或 `loop.call_soon_threadsafe` 桥接 |
 | **Linux 性能** | **零额外线程**，纯 ctypes 桥接非阻塞 `inotify` + `loop.add_reader` | 必须为每个 Emitter 启动一个独立的 Python OS 阻塞读取线程 |
-| **原子保存兼容** | **$100\%$ 兼容**，单文件监听自动监控父目录 + 顶层过滤，不怕 inode 丢失 | **有缺陷**，若直接监听文件 inode，在 Vim/VSCode 原子写入替换时会导致 Watch 丢失 |
+| **原子保存兼容** | 单文件监听父目录，并把外部临时文件替换归一化为目标文件事件 | 取决于 Observer 与 Handler 配置 |
 | **防抖降噪** | 内置 50ms 滑动窗口状态机，高频写入自动合并 | 无防抖，保存一个文件会瞬间触发数十个重复 Graves/modified 事件 |
-| **GitIgnore 剪枝** | 自动解析根及**嵌套 `.gitignore`**，并在注册阶段直接剪枝目录树，规避描述符耗尽 | 不支持自动解析，大项目（如 `node_modules`）极易耗尽系统描述符 |
-| **重命名同步** | 强力 Cookie 配对 / 事务包配对算法，自动同步重命名子目录的映射关系 | 部分平台上重命名子目录后，后续子目录内事件路径无法自动更新 |
-| **溢出容灾** | **支持**，检测到系统缓冲区满自动发出 `overflow` 事件，Watcher 继续稳定运行 | **不支持**，溢出时可能会遗漏事件，或直接停止工作/抛出未捕获异常 |
-| **根路径自愈** | **支持**，根监控目录被删除/卸载时挂起并轮询，一旦重建自动无缝重连底层监控 | **不支持**，根目录被删除时直接抛出 `FileNotFoundError` 或线程退出 |
+| **GitIgnore 剪枝** | 动态重载嵌套 `.gitignore`，支持常用 glob 子集 | 通常需要应用层过滤 |
+| **重命名同步** | Linux Cookie、Windows 事务包、FSEvents 启发式与 Polling inode 配对 | 依赖具体后端 |
+| **溢出容灾** | 发出 `overflow`；Linux 同时重建递归 watch 树 | 依赖具体后端 |
+| **根路径自愈** | 监听根消失或重建时重启后端 | 通常需要重建 Observer |
 
 ---
 
@@ -62,10 +62,8 @@ def on_moved(event):
     print(f"📦 [MOVED]: {event.src_path} -> {event.dest_path}")
 
 # 启动监听（阻塞当前线程，或在子线程中运行 w.start）
-try:
-    w.start()
-except KeyboardInterrupt:
-    w.stop()
+# 阻塞运行，直到 Ctrl+C 或其他线程调用 w.stop()
+w.start()
 ```
 
 ### 2. Level 2: 一行命令回调 (One-Liner Callback)
@@ -91,7 +89,7 @@ with FSWatcher("./watch_dir", debounce=0.05) as w:
 ```
 
 ### 4. Level 4: 异步原生迭代器 (Async Iterator) - ✨ 推荐
-完美契合现代异步框架（如 FastAPI, Sanic, Tornado）。纯 asyncio 驱动，零额外线程。
+适配 FastAPI、Sanic、Tornado 等异步框架。Linux 直接使用调用方事件循环；Windows/macOS 原生后端使用一个等待 OS 事件的辅助线程。
 ```python
 import asyncio
 from yyds_fswatch import FSWatcher
@@ -105,25 +103,48 @@ async def main():
 asyncio.run(main())
 ```
 
+### 生命周期、背压与后端控制
+
+```python
+import threading
+from yyds_fswatch import FSWatcher
+
+w = FSWatcher(
+    "./watch_dir",
+    max_queue_size=4096,   # 设为 0 可选择无界队列
+    backend="auto",       # auto | native | polling
+    recovery_interval=2.0,
+)
+thread = threading.Thread(target=w.start)
+thread.start()
+w.wait_until_ready(timeout=5)
+
+# 稍后安全停止
+w.stop()                  # 公开、幂等、线程安全
+thread.join()
+```
+
+监听尚不存在的文件时请设置 `target_type="file"`。如果需要接收 `dist`、`build`、`node_modules` 等常见生成目录内的事件，请设置 `ignore_common_dirs=False`。
+
 ---
 
 
 ## 🛡️ 深度技术优化细节
 
-1. **原子保存（Atomic Save）过滤**：对于 `data.json` 等单文件监控目标，系统会自动解析并在内存中劫持父目录的 `MOVED_TO` 及 `CREATE` 事件，完美过滤掉临时编辑器文件，确保编辑器以任何机制写入均能 $100\%$ 被正确捕获。
-2. **极速前缀过滤**：避开了传统对每个事件运行 `try-except ValueError` 和系统 `Path.resolve()` 的高开销行为，改用内存级绝对路径和预编译字符串前缀判定，处理吞吐量达到每秒 **10 万次以上**。
-3. **安全生命周期与内存泄露预防**：在退出迭代器或捕获 `KeyboardInterrupt` 时，库在后台自动投递 `_STOP_SENTINEL`，干净地断开并销毁 asyncio 事件循环资源；同时，提供 `close()` 机制释放忽略过滤器的 LRU 缓存，打破强引用循环，保障垃圾回收能即刻生效。
-4. **系统缓冲区溢出防崩溃（Overflow Event）**：当遭遇超高频文件修改导致操作系统级缓冲区满（Linux `IN_Q_OVERFLOW` / Windows `ERROR_MORE_DATA`）时，Watcher 会分发 `"overflow"` 事件而不会中断监控或抛异常，方便客户端捕获后重建状态。
-5. **层级嵌套 `.gitignore` 解析**：完美贴合 Git 行为，自动层级向下动态递归查找并解析各个子目录的 `.gitignore` 规则，按子目录深度生成分层相对路径正则进行精细化剪枝。
+1. **原子保存归一化**：对 `data.json` 等单文件目标监听父目录；临时文件覆盖已有目标时，对外产生目标路径上的 `modified`。
+2. **缓存路径过滤**：绝对根路径前缀判断与 4096 项有界决策缓存减少重复工作；不再使用未经基准验证的固定吞吐量数字。
+3. **生命周期与内存控制**：上下文管理器和公开 `stop()` 负责释放后端资源；用户态队列默认上限 4096，消费者落后时发出 `overflow`。
+4. **系统缓冲区溢出处理**：系统队列饱和时发出 `overflow`；Linux 还会重建 inotify 实例及递归 watch 树，防止永久漏掉目录注册。
+5. **层级嵌套 `.gitignore`**：规则文件变化时使缓存失效；支持常用 `*`、`?`、`**`、锚定、目录和否定规则，明确定位为常用子集而非逐字节等价的 Git 实现。
 6. **自愈性根目录丢失重连**：若监控的根目录被意外删除或磁盘卸载，系统会自动挂起平台监控并进入 2 秒低开销轮询重试。当根目录被重新创建，Watcher 将自动无缝恢复底层原生监听。
 
 ---
 
-## 📈 长期运行资源占用与稳定性（生产就绪）
+## 📈 长期运行资源控制
 
-`yyds-fswatch` 专为对稳定性要求极高的生产级常驻进程（如机器人、自动运维监控、长期运行的 Web 后端）设计，在资源管理上实施了严苛的物理限制，保障运行数月、数年无泄露：
+`yyds-fswatch` 提供适合常驻进程的资源控制；正式生产采用前仍应在每种目标操作系统和文件系统上完成验证：
 
-* **LRU 缓存物理上限**：`.gitignore` 过滤判断由 LRU 缓存驱动，上限锁定为 `4096` 条记录 (`lru_cache(maxsize=4096)`)。无论长期处理多少个不同路径的文件事件，内存开销均保持在恒定的 $O(1)$ 常数级，杜绝无界增长。
-* **空闲 CPU 占用为 $0.00\%$**：全平台底层驱动均采用原生系统调用事件机制（Linux `inotify`、macOS `FSEvents`、Windows `ReadDirectoryChangesW`）。在无文件变动的空闲状态下，线程及协程安全挂起，不消耗任何 CPU 资源。
+* **有界队列与缓存**：事件队列和 `.gitignore` 决策缓存默认上限均为 `4096`；后端描述符映射会随实际监听目录数量增长。
+* **低空闲开销**：原生驱动等待操作系统事件；轻量生命周期心跳保证跨线程及时停止，默认每 2 秒执行一次可配置的根路径健康检查，Polling 后端按配置间隔扫描。
 * **状态自动销毁机制**：防抖延迟队列和 Rename Cookie 等临时挂起状态均在 50ms 窗口后自动销毁并从内存 pop 清空，空闲时状态字典长度常态为 0。
 * **动态描述符剪枝与垃圾回收**：启动时根据 `.gitignore` 进行 Watch 树剪枝，规避 `ENOSPC` 描述符上限；当目录被物理删除时，捕获 `IN_IGNORED` 自动同步并释放内存映射句柄；在主动退出时，所有底层 FD 句柄均会被安全关闭。

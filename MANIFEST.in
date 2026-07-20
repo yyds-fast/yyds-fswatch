@@ -1,0 +1,6 @@
+include LICENSE
+include CHANGELOG.md
+include README.md
+include README_CN.md
+recursive-include examples *.py
+recursive-include tests *.py

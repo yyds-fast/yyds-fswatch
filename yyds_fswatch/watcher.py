@@ -1,70 +1,142 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import inspect
+import logging
 import queue
 import threading
-import sys
+import warnings
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Union, List, Tuple, Callable, Dict
+from typing import Union, List, Sequence, Callable, Dict, Optional, Set
 
 from .events import FSEvent
 from .ignore import GitIgnoreFilter
 
 _STOP_SENTINEL = object()
+_LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class PendingState:
     event_type: str
     is_directory: bool
-    dest_path: str = ""
 
 class FSWatcher:
-    def __init__(self, path: Union[str, Path, List[Union[str, Path]], Tuple[Union[str, Path]]], 
+    def __init__(self, path: Union[str, Path, Sequence[Union[str, Path]]],
                  recursive: bool = True, debounce: float = 0.05, 
-                 use_gitignore: bool = True, ignore_patterns: List[str] = None):
-        self._is_file_watch = False
-        self._file_targets = set()
-        self.paths = []
+                 use_gitignore: bool = True, ignore_patterns: List[str] = None,
+                 max_queue_size: int = 4096, recovery_interval: float = 2.0,
+                 poll_interval: float = 1.0, backend: str = "auto",
+                 target_type: str = "auto", ignore_common_dirs: bool = True):
+        """Create a file-system watcher.
+
+        ``target_type`` may be ``"auto"``, ``"file"`` or ``"directory"``.
+        The explicit forms are useful when the target does not exist yet.
+        ``max_queue_size=0`` restores the legacy unbounded queue behavior.
+        """
+        if debounce < 0:
+            raise ValueError("debounce must be greater than or equal to 0")
+        if max_queue_size < 0:
+            raise ValueError("max_queue_size must be greater than or equal to 0")
+        if recovery_interval <= 0:
+            raise ValueError("recovery_interval must be greater than 0")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be greater than 0")
+        if backend not in {"auto", "native", "polling"}:
+            raise ValueError("backend must be 'auto', 'native', or 'polling'")
+        if target_type not in {"auto", "file", "directory"}:
+            raise ValueError("target_type must be 'auto', 'file', or 'directory'")
+
+        self._file_targets: Set[Path] = set()
+        self._directory_targets: Set[Path] = set()
+        self._file_target_present: Dict[Path, bool] = {}
+        self.paths: List[Path] = []
 
         if isinstance(path, (str, Path)):
             raw_paths = [Path(path)]
         else:
             raw_paths = [Path(p) for p in path]
 
+        if not raw_paths:
+            raise ValueError("at least one watch path is required")
+
         for p in raw_paths:
             p_resolved = p.resolve()
-            if p_resolved.is_file():
-                self._is_file_watch = True
+            is_file_target = target_type == "file" or (
+                target_type == "auto" and p_resolved.is_file()
+            )
+            if is_file_target:
                 self._file_targets.add(p_resolved)
-                self._file_targets.add(p_resolved.absolute())
+                self._file_target_present[p_resolved] = p_resolved.exists()
                 self.paths.append(p_resolved.parent)
             else:
+                self._directory_targets.add(p_resolved)
                 self.paths.append(p_resolved)
 
         self.paths = list(dict.fromkeys(self.paths))
+        # Kept for compatibility with code that inspected the old private flag.
+        self._is_file_watch = bool(self._file_targets) and not self._directory_targets
 
         self.recursive = recursive
         self.debounce = debounce
         self.use_gitignore = use_gitignore
         self.ignore_patterns = ignore_patterns
+        self.ignore_common_dirs = ignore_common_dirs
+        self.max_queue_size = max_queue_size
+        self.recovery_interval = recovery_interval
+        self.poll_interval = poll_interval
+        self.backend_preference = backend
 
         self._callbacks: Dict[str, List[Callable]] = {}
-        self._queue: asyncio.Queue = None
-        self._loop: asyncio.AbstractEventLoop = None
+        self._queue: Optional[asyncio.Queue] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._watcher = None
         self._ignore_filter = None
+        self._backend_name = None
+        self._recovery_task = None
+        self._stop_monitor_task = None
 
         # Debounce state
         self._pending_events: Dict[Path, PendingState] = {}
         self._pending_timers: Dict[Path, asyncio.TimerHandle] = {}
 
         # Sync iteration state
-        self._sync_queue: queue.Queue = None
-        self._bg_thread: threading.Thread = None
-        self._bg_loop: asyncio.AbstractEventLoop = None
-        self._bg_task: asyncio.Task = None
+        self._sync_queue: Optional[queue.Queue] = None
+        self._bg_thread: Optional[threading.Thread] = None
+        self._bg_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._bg_task: Optional[asyncio.Task] = None
+        self._ready_event = threading.Event()
+        self._stop_requested = threading.Event()
+        self._startup_error = None
+        self._queue_overflow_pending = False
+        self._sync_overflow_pending = False
+        self._dropped_event_count = 0
         self.is_ready = False
+
+    @property
+    def backend(self) -> Optional[str]:
+        """Name of the active backend, once the watcher has started."""
+        return self._backend_name
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the context is active and its platform backend is healthy."""
+        return bool(
+            self.is_ready and self._watcher and
+            getattr(self._watcher, "is_running", False)
+        )
+
+    @property
+    def dropped_event_count(self) -> int:
+        """Number of userspace events dropped because a queue was full."""
+        return self._dropped_event_count
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """Wait for a background/synchronous watcher to finish starting."""
+        ready = self._ready_event.wait(timeout)
+        if ready and self._startup_error is not None:
+            raise RuntimeError("file-system watcher failed to start") from self._startup_error
+        return ready
 
     def on(self, event_type: str):
         """Decorator to register event callbacks."""
@@ -77,10 +149,33 @@ class FSWatcher:
     # --- Synchronous Loop Mode (Level 1) ---
     def start(self):
         """Start blocking monitoring loop (Ctrl+C to exit)."""
+        self._stop_requested.clear()
+        self._ready_event.clear()
+        self._startup_error = None
         try:
             asyncio.run(self._run_decorator_loop())
         except KeyboardInterrupt:
-            pass
+            self.stop()
+
+    def stop(self):
+        """Request a running watcher to stop.
+
+        This method is idempotent and safe to call from another thread. Context
+        managers still perform the actual resource cleanup.
+        """
+        self._stop_requested.set()
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(self._request_async_stop)
+            except RuntimeError:
+                pass
+
+    close = stop
+
+    def _request_async_stop(self):
+        if self._queue is not None:
+            self._force_async_put(_STOP_SENTINEL)
 
     async def _run_decorator_loop(self):
         async with self as w:
@@ -93,25 +188,44 @@ class FSWatcher:
                         if asyncio.iscoroutinefunction(cb):
                             await cb(event)
                         else:
-                            cb(event)
-                    except Exception as e:
-                        print(f"Error in yyds-fswatch callback: {e}", file=sys.stderr)
+                            result = cb(event)
+                            if inspect.isawaitable(result):
+                                await result
+                    except Exception:
+                        _LOGGER.exception("Error in yyds-fswatch callback")
 
     # --- Synchronous Context & Iterator Mode (Level 3) ---
     def __enter__(self):
-        self._sync_queue = queue.Queue()
-        self._bg_thread = threading.Thread(target=self._run_bg_loop)
+        if self._bg_thread is not None and self._bg_thread.is_alive():
+            raise RuntimeError("watcher is already running")
+        self._stop_requested.clear()
+        self._ready_event.clear()
+        self._startup_error = None
+        self._sync_queue = queue.Queue(maxsize=self.max_queue_size)
+        self._bg_thread = threading.Thread(target=self._run_bg_loop, name="yyds-fswatch")
         self._bg_thread.daemon = True
         self._bg_thread.start()
+        try:
+            ready = self.wait_until_ready(timeout=5.0)
+        except Exception:
+            self.stop()
+            self._bg_thread.join(timeout=2.0)
+            raise
+        if not ready:
+            self.stop()
+            self._bg_thread.join(timeout=2.0)
+            raise TimeoutError("file-system watcher did not become ready within 5 seconds")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stop_requested.set()
         if self._bg_loop and self._bg_loop.is_running():
             self._bg_loop.call_soon_threadsafe(self._stop_bg_loop)
         if self._bg_thread:
             self._bg_thread.join(timeout=2.0)
-        # Put final sentinel just in case
-        self._sync_queue.put(_STOP_SENTINEL)
+        # Put final sentinel just in case.
+        if self._sync_queue is not None:
+            self._force_sync_put(_STOP_SENTINEL)
         if self._ignore_filter:
             self._ignore_filter.close()
             self._ignore_filter = None
@@ -124,17 +238,22 @@ class FSWatcher:
             try:
                 async with self as w:
                     async for event in w:
-                        self._sync_queue.put(event)
+                        self._put_sync_event(event)
             except asyncio.CancelledError:
                 pass
+            except Exception as exc:
+                self._startup_error = exc
+                self._ready_event.set()
             finally:
-                self._sync_queue.put(_STOP_SENTINEL)
+                if self._sync_queue is not None:
+                    self._force_sync_put(_STOP_SENTINEL)
 
         self._bg_task = self._bg_loop.create_task(run())
         try:
             self._bg_loop.run_until_complete(self._bg_task)
         finally:
             self._bg_loop.close()
+            self._bg_loop = None
 
     def _stop_bg_loop(self):
         if self._bg_task:
@@ -144,50 +263,124 @@ class FSWatcher:
         return self
 
     def __next__(self):
+        if self._sync_queue is None:
+            raise RuntimeError("use 'with FSWatcher(...) as watcher' before iterating")
         event = self._sync_queue.get()
         if event is _STOP_SENTINEL:
+            if self._startup_error is not None:
+                raise RuntimeError("file-system watcher stopped after an error") from self._startup_error
             raise StopIteration
+        if isinstance(event, FSEvent) and event.event_type == "overflow":
+            self._sync_overflow_pending = False
         return event
 
     # --- Asynchronous Context & Iterator Mode (Level 4) ---
     async def __aenter__(self):
+        if self.is_ready or self._watcher is not None:
+            raise RuntimeError("watcher is already running")
+        self._ready_event.clear()
+        self._startup_error = None
         self._loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue()
+        self._queue = asyncio.Queue(maxsize=self.max_queue_size)
         self._recovery_task = None
-        
-        # Load Ignore rules
-        self._ignore_filter = GitIgnoreFilter(self.paths, self.use_gitignore, self.ignore_patterns)
+        self._stop_monitor_task = None
+        self._queue_overflow_pending = False
+        self._sync_overflow_pending = False
+        self._file_target_present = {p: p.exists() for p in self._file_targets}
 
-        # Factory resolve platform watcher
-        from ._platforms import get_platform_watcher_class
-        watcher_cls = get_platform_watcher_class()
-        
-        self._watcher = watcher_cls(
+        try:
+            # Load Ignore rules
+            self._ignore_filter = GitIgnoreFilter(
+                self.paths,
+                self.use_gitignore,
+                self.ignore_patterns,
+                ignore_common_dirs=self.ignore_common_dirs,
+            )
+
+            # Factory resolve platform watcher
+            from ._platforms import get_platform_watcher_class
+            watcher_cls = get_platform_watcher_class(self.backend_preference)
+            self._watcher = self._create_platform_watcher(watcher_cls)
+
+            if self._existing_paths():
+                self._start_platform_watcher()
+
+            self.is_ready = True
+            self._ready_event.set()
+            self._recovery_task = self._loop.create_task(self._recovery_loop())
+            self._stop_monitor_task = self._loop.create_task(self._stop_monitor_loop())
+            if self._stop_requested.is_set():
+                self._request_async_stop()
+            return self
+        except Exception as exc:
+            self._startup_error = exc
+            self._ready_event.set()
+            if self._watcher is not None:
+                try:
+                    self._watcher.stop()
+                except Exception:
+                    pass
+                self._watcher = None
+            if self._ignore_filter is not None:
+                self._ignore_filter.close()
+                self._ignore_filter = None
+            self._stop_requested.clear()
+            raise
+
+    def _existing_paths(self):
+        return frozenset(p for p in self.paths if p.exists())
+
+    def _create_platform_watcher(self, watcher_cls):
+        kwargs = dict(
             paths=self.paths,
             recursive=self.recursive,
             loop=self._loop,
             on_raw_event=self._on_raw_event,
-            ignore_filter=self._ignore_filter
+            ignore_filter=self._ignore_filter,
         )
-        
-        any_missing = any(not p.exists() for p in self.paths)
-        if not any_missing:
+        from ._platforms._polling import PollingWatcher
+        if watcher_cls is PollingWatcher:
+            kwargs["interval"] = self.poll_interval
+        watcher = watcher_cls(**kwargs)
+        self._backend_name = watcher_cls.__name__
+        return watcher
+
+    def _start_platform_watcher(self):
+        try:
             self._watcher.start()
-            
-        self.is_ready = True
-        self._recovery_task = self._loop.create_task(self._recovery_loop())
-        return self
+        except Exception as exc:
+            from ._platforms._polling import PollingWatcher
+            if self.backend_preference != "auto" or isinstance(self._watcher, PollingWatcher):
+                raise
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+            warnings.warn(
+                "Native file-system watcher failed to start; falling back to polling: "
+                f"{exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._watcher = self._create_platform_watcher(PollingWatcher)
+            self._watcher.start()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         self.is_ready = False
-        
-        if self._recovery_task:
-            self._recovery_task.cancel()
+
+        background_tasks = [self._recovery_task, self._stop_monitor_task]
+        for task in background_tasks:
+            if task:
+                task.cancel()
+        for task in background_tasks:
+            if not task:
+                continue
             try:
-                await self._recovery_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._recovery_task = None
+        self._recovery_task = None
+        self._stop_monitor_task = None
 
         # Stop background platform monitoring
         for timer in self._pending_timers.values():
@@ -196,57 +389,104 @@ class FSWatcher:
         self._pending_events.clear()
 
         if self._watcher:
-            self._watcher.stop()
+            try:
+                self._watcher.stop()
+            except Exception as exc:
+                self._loop.call_exception_handler({
+                    "message": "yyds-fswatch backend cleanup failed",
+                    "exception": exc,
+                })
             self._watcher = None
+            # Let cancelled backend tasks observe cancellation before a
+            # short-lived background event loop is closed.
+            await asyncio.sleep(0)
 
         if self._ignore_filter:
             self._ignore_filter.close()
             self._ignore_filter = None
 
-        self._queue.put_nowait(_STOP_SENTINEL)
+        if self._queue is not None:
+            self._force_async_put(_STOP_SENTINEL)
+        self._stop_requested.clear()
+
+    async def _stop_monitor_loop(self):
+        """Fallback for event loops whose cross-thread wakeup is delayed."""
+        while self.is_ready and not self._stop_requested.is_set():
+            await asyncio.sleep(0.1)
+        if self.is_ready and self._stop_requested.is_set():
+            self._request_async_stop()
 
     async def _recovery_loop(self):
-        any_missing = any(not p.exists() for p in self.paths)
-        watcher_running = not any_missing
+        existing_paths = self._existing_paths()
+        watcher_running = bool(existing_paths)
         
         while self.is_ready:
             try:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(self.recovery_interval)
                 if not self.is_ready:
                     break
-                any_missing = any(not p.exists() for p in self.paths)
-                
-                if any_missing and watcher_running:
+                current_paths = self._existing_paths()
+
+                backend_healthy = bool(
+                    self._watcher and getattr(self._watcher, "is_running", False)
+                )
+                if current_paths and watcher_running and not backend_healthy:
+                    try:
+                        self._watcher.stop()
+                    except Exception:
+                        pass
+                    watcher_running = False
+
+                if current_paths != existing_paths and watcher_running:
                     if self._watcher:
                         self._watcher.stop()
                     watcher_running = False
-                elif not any_missing and not watcher_running:
+
+                if current_paths != existing_paths and self._ignore_filter:
+                    self._ignore_filter.refresh()
+
+                if current_paths and not watcher_running:
                     if self._watcher:
                         try:
-                            self._watcher.start()
+                            self._start_platform_watcher()
                             watcher_running = True
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            self._loop.call_exception_handler({
+                                "message": "yyds-fswatch failed to recover its backend",
+                                "exception": exc,
+                            })
+                existing_paths = current_paths
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                self._loop.call_exception_handler({
+                    "message": "yyds-fswatch recovery loop failed",
+                    "exception": exc,
+                })
 
     def __aiter__(self):
         return self
 
     async def __anext__(self) -> FSEvent:
+        if self._queue is None:
+            raise RuntimeError("use 'async with FSWatcher(...) as watcher' before iterating")
         event = await self._queue.get()
         if event is _STOP_SENTINEL:
             raise StopAsyncIteration
+        if isinstance(event, FSEvent) and event.event_type == "overflow":
+            self._queue_overflow_pending = False
         return event
 
     # --- Debounce Mechanism ---
     def _on_raw_event(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
         """Called by the platform watcher when a change is detected."""
+        if self._loop is None or self._loop.is_closed():
+            return
         self._loop.call_soon_threadsafe(self._push_to_debounce, event_type, path, is_dir, dest_path)
 
     def _push_to_debounce(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
+        if not self.is_ready or self._stop_requested.is_set():
+            return
         if event_type == "overflow":
             # Flush all pending events first to preserve order
             for p in list(self._pending_events.keys()):
@@ -261,20 +501,33 @@ class FSWatcher:
             self._emit_event(event)
             return
 
-        # 0. If we are watching specific files, filter out events for other files in the parent directory
-        if self._is_file_watch:
-            path_abs = path.absolute()
-            dest_abs = Path(dest_path).absolute() if dest_path else None
-            is_target = path_abs in self._file_targets or \
-                        (dest_abs and dest_abs in self._file_targets)
-            if not is_target:
-                return
+        path = Path(path).absolute()
+        dest_path = Path(dest_path).absolute() if dest_path else None
 
-        # 1. Filter out ignored files/folders
-        if self._ignore_filter and self._ignore_filter.is_ignored(path, is_dir):
+        if self._ignore_filter:
+            self._ignore_filter.notify_event(event_type, path, is_dir, dest_path)
+
+        source_visible = self._is_visible_path(path, is_dir)
+        dest_visible = bool(dest_path and self._is_visible_path(dest_path, is_dir))
+
+        # Convert moves across the visible boundary into a deletion or creation.
+        if event_type == "moved":
+            if source_visible and dest_visible:
+                pass
+            elif source_visible:
+                event_type = "deleted"
+                dest_path = None
+            elif dest_visible:
+                was_present = self._file_target_present.get(dest_path, False)
+                event_type = "modified" if was_present else "created"
+                path = dest_path
+                dest_path = None
+            else:
+                return
+        elif not source_visible:
             return
-        if dest_path and self._ignore_filter and self._ignore_filter.is_ignored(dest_path, is_dir):
-            return
+
+        self._update_file_target_state(event_type, path, dest_path)
 
         # 2. moved events bypass debounce to prevent rename cookie loss/delay
         if event_type == "moved":
@@ -322,6 +575,37 @@ class FSWatcher:
         else:
             self._flush_event(path)
 
+    def _is_visible_path(self, path: Path, is_dir: bool) -> bool:
+        if not self._is_path_in_scope(path):
+            return False
+        if self._ignore_filter and self._ignore_filter.is_ignored(path, is_dir):
+            return False
+        return True
+
+    def _is_path_in_scope(self, path: Path) -> bool:
+        path = Path(path).absolute()
+        if path in self._file_targets:
+            return True
+        for root in self._directory_targets:
+            if path == root:
+                return True
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            if self.recursive or len(relative.parts) == 1:
+                return True
+        return False
+
+    def _update_file_target_state(self, event_type: str, path: Path, dest_path: Path = None):
+        if path in self._file_targets:
+            if event_type in {"created", "modified"}:
+                self._file_target_present[path] = True
+            elif event_type in {"deleted", "moved"}:
+                self._file_target_present[path] = False
+        if event_type == "moved" and dest_path in self._file_targets:
+            self._file_target_present[dest_path] = True
+
     def _flush_event(self, path: Path):
         state = self._pending_events.pop(path, None)
         self._pending_timers.pop(path, None)
@@ -334,19 +618,84 @@ class FSWatcher:
             self._emit_event(event)
 
     def _emit_event(self, event: FSEvent):
-        if self._queue:
+        if self._queue is None or self._stop_requested.is_set():
+            return
+        try:
             self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self._dropped_event_count += 1
+            if self._queue_overflow_pending:
+                return
+            self._queue_overflow_pending = True
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._force_async_put(self._make_backpressure_overflow_event())
+
+    def _make_backpressure_overflow_event(self):
+        root = self.paths[0] if self.paths else Path(".").absolute()
+        return FSEvent("overflow", str(root), is_directory=False)
+
+    def _force_async_put(self, item):
+        if self._queue is None:
+            return
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._queue.put_nowait(item)
+
+    def _put_sync_event(self, event):
+        if self._sync_queue is None or self._stop_requested.is_set():
+            return
+        try:
+            self._sync_queue.put_nowait(event)
+        except queue.Full:
+            self._dropped_event_count += 1
+            if self._sync_overflow_pending:
+                return
+            self._sync_overflow_pending = True
+            try:
+                self._sync_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._force_sync_put(self._make_backpressure_overflow_event())
+
+    def _force_sync_put(self, item):
+        if self._sync_queue is None:
+            return
+        try:
+            self._sync_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._sync_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._sync_queue.put_nowait(item)
 
 
-def watch(path: Union[str, Path, List[Union[str, Path]]], on_change: Callable[[FSEvent], None], 
+def watch(path: Union[str, Path, Sequence[Union[str, Path]]], on_change: Callable[[FSEvent], None],
           recursive: bool = True, debounce: float = 0.05, 
-          use_gitignore: bool = True, ignore_patterns: List[str] = None):
+          use_gitignore: bool = True, ignore_patterns: List[str] = None,
+          max_queue_size: int = 4096, recovery_interval: float = 2.0,
+          poll_interval: float = 1.0, backend: str = "auto",
+          target_type: str = "auto", ignore_common_dirs: bool = True):
     """Level 2 Callback One-liner API."""
     w = FSWatcher(path, recursive=recursive, debounce=debounce, 
-                  use_gitignore=use_gitignore, ignore_patterns=ignore_patterns)
+                  use_gitignore=use_gitignore, ignore_patterns=ignore_patterns,
+                  max_queue_size=max_queue_size,
+                  recovery_interval=recovery_interval,
+                  poll_interval=poll_interval, backend=backend,
+                  target_type=target_type,
+                  ignore_common_dirs=ignore_common_dirs)
     
     @w.on('*')
     def handler(event: FSEvent):
-        on_change(event)
+        return on_change(event)
         
     w.start()
+    return w

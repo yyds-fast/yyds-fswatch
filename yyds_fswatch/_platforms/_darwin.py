@@ -3,8 +3,10 @@ import sys
 if sys.platform != "darwin":
     raise ImportError("macOS only")
 
+import asyncio
 import ctypes
 import ctypes.util
+import os
 import threading
 from pathlib import Path
 from typing import List, Callable
@@ -87,9 +89,17 @@ kFSEventStreamCreateFlagNoDefer = 0x00000002
 
 kFSEventStreamEventFlagItemCreated = 0x00000100
 kFSEventStreamEventFlagItemRemoved = 0x00000200
+kFSEventStreamEventFlagItemInodeMetaMod = 0x00000400
 kFSEventStreamEventFlagItemModified = 0x00001000
+kFSEventStreamEventFlagItemFinderInfoMod = 0x00002000
+kFSEventStreamEventFlagItemChangeOwner = 0x00004000
+kFSEventStreamEventFlagItemXattrMod = 0x00008000
 kFSEventStreamEventFlagItemRenamed = 0x00000800
 kFSEventStreamEventFlagItemIsDir = 0x00020000
+kFSEventStreamEventFlagMustScanSubDirs = 0x00000001
+kFSEventStreamEventFlagUserDropped = 0x00000002
+kFSEventStreamEventFlagKernelDropped = 0x00000004
+kFSEventStreamEventFlagEventIdsWrapped = 0x00000008
 
 # Callback Type
 FSEventStreamCallback = ctypes.CFUNCTYPE(
@@ -105,97 +115,165 @@ FSEventStreamCallback = ctypes.CFUNCTYPE(
 class DarwinWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
                  on_raw_event: Callable, ignore_filter=None):
-        import asyncio
         super().__init__(paths, recursive, loop, on_raw_event)
         self._ignore_filter = ignore_filter
         self._stream = None
         self._run_loop = None
         self._thread = None
         self._callback_ref = None
+        self._started_event = threading.Event()
+        self._startup_error = None
+        self._stop_requested = threading.Event()
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive() and self._startup_error is None
 
     def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("macOS watcher is already running")
+        self._started_event.clear()
+        self._stop_requested.clear()
+        self._startup_error = None
         # We must keep a reference to the callback function to prevent garbage collection
         self._callback_ref = FSEventStreamCallback(self._py_callback)
         
-        self._thread = threading.Thread(target=self._run_stream)
-        self._thread.daemon = True
+        self._thread = threading.Thread(
+            target=self._run_stream,
+            name="yyds-fswatch-fsevents",
+            daemon=True,
+        )
         self._thread.start()
+        if not self._started_event.wait(timeout=5.0):
+            self.stop()
+            raise TimeoutError("FSEvents stream did not start within 5 seconds")
+        if self._startup_error is not None:
+            self.stop()
+            raise RuntimeError("FSEvents stream failed to start") from self._startup_error
 
     def stop(self):
+        self._stop_requested.set()
         if self._run_loop:
             CFRunLoopStop(self._run_loop)
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._thread is not None and self._thread.is_alive():
+            # Keep callback and stream references alive: releasing them while C
+            # may still invoke the callback can crash the interpreter.
+            return
         self._stream = None
         self._run_loop = None
         self._thread = None
         self._callback_ref = None
 
     def _run_stream(self):
-        # Resolve CFStrings for all paths
+        try:
+            self._run_stream_impl()
+        except Exception as exc:
+            self._startup_error = exc
+            if self._started_event.is_set():
+                try:
+                    self.loop.call_soon_threadsafe(
+                        self.loop.call_exception_handler,
+                        {"message": "yyds-fswatch FSEvents stream failed", "exception": exc},
+                    )
+                except RuntimeError:
+                    pass
+        finally:
+            self._started_event.set()
+
+    def _run_stream_impl(self):
         c_strings = []
-        for path in self.paths:
-            path_str = str(path.resolve()).encode('utf-8')
-            cf_str = CFStringCreateWithCString(None, path_str, kCFStringEncodingUTF8)
-            c_strings.append(cf_str)
-            
-        # Create CFArray of CFStrings
-        paths_array = (ctypes.c_void_p * len(c_strings))(*c_strings)
-        cf_paths = CFArrayCreate(None, paths_array, len(c_strings), None)
-        
-        # Latency of events (seconds)
-        latency = 0.01
-        
-        flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
-        
-        # Create FSEventStream
-        self._stream = FSEventStreamCreate(
-            None,
-            self._callback_ref,
-            None,
-            cf_paths,
-            kFSEventStreamEventIdSinceNow,
-            latency,
-            flags
-        )
-        
-        # Release the CFType refs we created
-        CFRelease(cf_paths)
-        for cf_str in c_strings:
-            CFRelease(cf_str)
-            
-        if not self._stream:
-            raise OSError("FSEventStreamCreate failed")
-            
-        self._run_loop = CFRunLoopGetCurrent()
-        
-        # Schedule with loop Mode (Default CFRunLoopMode)
-        # CFRunLoopCommonModes or kCFRunLoopDefaultMode
-        default_mode = CFStringCreateWithCString(None, b"kCFRunLoopDefaultMode", kCFStringEncodingUTF8)
-        FSEventStreamScheduleWithRunLoop(self._stream, self._run_loop, default_mode)
-        CFRelease(default_mode)
-        
-        if not FSEventStreamStart(self._stream):
-            raise OSError("FSEventStreamStart failed")
-            
-        #CFRunLoopRun blocks this background thread
-        CFRunLoopRun()
-        
-        # Clean up on exit
-        FSEventStreamStop(self._stream)
-        FSEventStreamInvalidate(self._stream)
-        FSEventStreamRelease(self._stream)
+        cf_paths = None
+        stream_started = False
+        try:
+            for path in self.paths:
+                if not path.exists():
+                    continue
+                path_str = str(path.resolve()).encode("utf-8")
+                cf_string = CFStringCreateWithCString(None, path_str, kCFStringEncodingUTF8)
+                if not cf_string:
+                    raise OSError(f"CFStringCreateWithCString failed for {path}")
+                c_strings.append(cf_string)
+
+            if not c_strings:
+                raise FileNotFoundError("no watch path currently exists")
+
+            paths_array = (ctypes.c_void_p * len(c_strings))(*c_strings)
+            cf_paths = CFArrayCreate(None, paths_array, len(c_strings), None)
+            if not cf_paths:
+                raise OSError("CFArrayCreate failed")
+
+            flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
+            self._stream = FSEventStreamCreate(
+                None,
+                self._callback_ref,
+                None,
+                cf_paths,
+                kFSEventStreamEventIdSinceNow,
+                0.01,
+                flags,
+            )
+            if not self._stream:
+                raise OSError("FSEventStreamCreate failed")
+
+            # FSEventStreamCreate retains the path array.
+            CFRelease(cf_paths)
+            cf_paths = None
+            for cf_string in c_strings:
+                CFRelease(cf_string)
+            c_strings.clear()
+
+            self._run_loop = CFRunLoopGetCurrent()
+            default_mode = CFStringCreateWithCString(
+                None,
+                b"kCFRunLoopDefaultMode",
+                kCFStringEncodingUTF8,
+            )
+            if not default_mode:
+                raise OSError("failed to create the FSEvents run-loop mode")
+            try:
+                FSEventStreamScheduleWithRunLoop(self._stream, self._run_loop, default_mode)
+            finally:
+                CFRelease(default_mode)
+
+            if not FSEventStreamStart(self._stream):
+                raise OSError("FSEventStreamStart failed")
+            stream_started = True
+            self._started_event.set()
+
+            if not self._stop_requested.is_set():
+                CFRunLoopRun()
+        finally:
+            if cf_paths:
+                CFRelease(cf_paths)
+            for cf_string in c_strings:
+                CFRelease(cf_string)
+            if self._stream:
+                if stream_started:
+                    FSEventStreamStop(self._stream)
+                FSEventStreamInvalidate(self._stream)
+                FSEventStreamRelease(self._stream)
+            self._stream = None
+            self._run_loop = None
 
     def _py_callback(self, streamRef, clientCallBackInfo, numEvents, eventPaths, eventFlags, eventIds):
         paths_ptr = ctypes.cast(eventPaths, ctypes.POINTER(ctypes.c_char_p))
         rename_candidates = []
         
         for i in range(numEvents):
-            path_str = paths_ptr[i].decode('utf-8', errors='replace')
+            path_str = os.fsdecode(paths_ptr[i])
             path = Path(path_str)
             flags = eventFlags[i]
             
             is_dir = bool(flags & kFSEventStreamEventFlagItemIsDir)
+
+            if flags & (kFSEventStreamEventFlagMustScanSubDirs |
+                        kFSEventStreamEventFlagUserDropped |
+                        kFSEventStreamEventFlagKernelDropped |
+                        kFSEventStreamEventFlagEventIdsWrapped):
+                self.on_raw_event("overflow", path, False)
+                continue
             
             # Match flags to raw events
             if flags & kFSEventStreamEventFlagItemRenamed:
@@ -205,26 +283,24 @@ class DarwinWatcher(BaseWatcher):
                 self.on_raw_event("created", path, is_dir)
             elif flags & kFSEventStreamEventFlagItemRemoved:
                 self.on_raw_event("deleted", path, is_dir)
-            elif flags & kFSEventStreamEventFlagItemModified:
+            elif flags & (kFSEventStreamEventFlagItemModified |
+                          kFSEventStreamEventFlagItemInodeMetaMod |
+                          kFSEventStreamEventFlagItemFinderInfoMod |
+                          kFSEventStreamEventFlagItemChangeOwner |
+                          kFSEventStreamEventFlagItemXattrMod):
                 self.on_raw_event("modified", path, is_dir)
                 
-        # Handle rename candidates pairing
-        # In FSEvents, moves inside the directory stream produce 2 renamed events sequentially.
-        # The first is the old path (source) and the second is the new path (destination).
-        idx = 0
-        while idx < len(rename_candidates):
-            if idx + 1 < len(rename_candidates):
-                old_path, old_is_dir = rename_candidates[idx]
-                new_path, _ = rename_candidates[idx+1]
-                self.on_raw_event("moved", old_path, old_is_dir, dest_path=new_path)
-                idx += 2
-            else:
-                # Single rename candidate remains (moved out or moved in)
-                path, is_dir = rename_candidates[idx]
-                if path.exists():
-                    # If it exists, it was moved into the watched directory -> created
-                    self.on_raw_event("created", path, is_dir)
-                else:
-                    # If it doesn't exist, it was moved out -> deleted
-                    self.on_raw_event("deleted", path, is_dir)
-                idx += 1
+        # FSEvents has no rename cookie. Pair missing paths with existing paths
+        # in the same batch; treating every adjacent pair as a move corrupts
+        # two simultaneous inbound or outbound renames.
+        removed = [(path, is_dir) for path, is_dir in rename_candidates if not path.exists()]
+        added = [(path, is_dir) for path, is_dir in rename_candidates if path.exists()]
+        pair_count = min(len(removed), len(added))
+        for index in range(pair_count):
+            old_path, old_is_dir = removed[index]
+            new_path, _ = added[index]
+            self.on_raw_event("moved", old_path, old_is_dir, dest_path=new_path)
+        for path, is_dir in removed[pair_count:]:
+            self.on_raw_event("deleted", path, is_dir)
+        for path, is_dir in added[pair_count:]:
+            self.on_raw_event("created", path, is_dir)

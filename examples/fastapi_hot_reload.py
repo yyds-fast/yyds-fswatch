@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     watcher = FSWatcher(CONFIG_FILE, recursive=False, debounce=0.05)
     
     async def config_watcher_task():
-        # async with 会自动在 asyncio loop 中绑定非阻塞监听接口，零额外线程开销
+        # Linux 原生后端直接绑定 asyncio loop；其他后端会安全桥接 OS 等待线程。
         async with watcher as w:
             async for event in w:
                 print(f"检测到文件变更, {event}")

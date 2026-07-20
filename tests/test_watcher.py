@@ -4,9 +4,8 @@ import unittest
 import tempfile
 import shutil
 import time
-import os
 from pathlib import Path
-from yyds_fswatch import FSWatcher, FSEvent
+from yyds_fswatch import FSWatcher
 
 class TestFSWatcher(unittest.TestCase):
     def setUp(self):
@@ -121,11 +120,10 @@ class TestFSWatcher(unittest.TestCase):
         (self.test_dir / "decor.txt").touch()
         time.sleep(0.2)  # Wait for event dispatch
 
-        if watcher._loop:
-            from yyds_fswatch.watcher import _STOP_SENTINEL
-            watcher._loop.call_soon_threadsafe(lambda: watcher._queue.put_nowait(_STOP_SENTINEL))
+        watcher.stop()
             
         t_watcher.join(timeout=2.0)
+        self.assertFalse(t_watcher.is_alive())
 
         # We touched decor.txt. We expect:
         # 1. on_created called (1 event)

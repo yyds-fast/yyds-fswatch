@@ -4,12 +4,11 @@ import unittest
 import tempfile
 import shutil
 import time
-import os
 import gc
 import weakref
 import asyncio
 from pathlib import Path
-from yyds_fswatch import FSWatcher, FSEvent
+from yyds_fswatch import FSWatcher
 from yyds_fswatch.ignore import GitIgnoreFilter
 
 class TestFSWatcherIndustrial(unittest.TestCase):
@@ -101,7 +100,7 @@ class TestFSWatcherIndustrial(unittest.TestCase):
         self.assertEqual(events[1].event_type, "overflow")
 
     def test_root_recovery(self):
-        watcher = FSWatcher(self.test_dir, debounce=0.05)
+        watcher = FSWatcher(self.test_dir, debounce=0.05, recovery_interval=0.05)
         events = []
 
         def perform_root_operations():
@@ -114,11 +113,11 @@ class TestFSWatcherIndustrial(unittest.TestCase):
 
             # 1. Delete root directory
             shutil.rmtree(self.test_dir, ignore_errors=True)
-            time.sleep(2.5) # Wait for recovery loop to detect missing path and stop watcher
+            time.sleep(0.15) # Wait for recovery loop to detect missing path and stop watcher
 
             # 2. Recreate root directory
             self.test_dir.mkdir(exist_ok=True)
-            time.sleep(2.5) # Wait for recovery loop to detect recreated path and restart watcher
+            time.sleep(0.15) # Wait for recovery loop to detect recreated path and restart watcher
 
             # 3. Create a file inside recreated root directory
             (self.test_dir / "recovered.txt").touch()

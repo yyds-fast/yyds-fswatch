@@ -1,8 +1,8 @@
 # 🚀 yyds-fswatch
 
-[中文文档 (Chinese Version)](README_CN.md)
+[中文文档 (Chinese Version)](https://github.com/yyds/yyds-fswatch/blob/main/README_CN.md)
 
-`yyds-fswatch` is a high-performance, asyncio-native, and developer-friendly file system watching library for Python. It is designed to fully replace and outperform the traditional `watchdog` library.
+`yyds-fswatch` is a lightweight, asyncio-friendly, and developer-friendly file system watching library for Python. It offers a compact alternative to observer/handler-style APIs while keeping platform fallbacks explicit and observable.
 
 ---
 
@@ -13,12 +13,12 @@
 | **API Usability** | 4-level progressive API (Decorators / Callbacks / Sync Iter / Async Iter) | Verbose Observer + Handler class inheritance system |
 | **Async Integration** | **Native coroutine support** (`async with` and `async for`) | Requires manual threadpools or `loop.call_soon_threadsafe` bridging |
 | **Linux Performance** | **Zero additional threads** (ctypes non-blocking `inotify` + `loop.add_reader`) | Starts an independent Python blocking thread for each Emitter |
-| **Atomic Save Support** | **$100\%$ compatible**. File watches automatically fall back to parent directory + top-level filter | Direct file watching fails and loses watch handle upon Vim/VSCode atomic saves |
+| **Atomic Save Support** | File watches monitor the parent directory and normalize inbound replacement moves to target-file events | Behavior depends on the observer and handler configuration |
 | **Debounce & Coalesce** | Built-in 50ms sliding window state machine | No debouncing; saving one file triggers dozens of redundant `modified` events |
-| **GitIgnore Pruning** | Parses root and **nested `.gitignore`** dynamically, pruning directories at registration | No nested parsing/pruning; large repos easily exhaust descriptors |
-| **Rename Sync** | Robust transaction-packet & cookie pairing. Automatically updates subdirectory path mappings | Subdirectory path mappings get out of sync, reporting stale paths for events |
-| **Overflow Resilience** | **Supported**. Emits an `overflow` event when system buffers are saturated, continuing normally | **Unsupported**. Misses events silently or crashes the watch thread |
-| **Root Self-Healing** | **Supported**. Pauses and polls when root directories are deleted/unmounted, auto-recovering | **Unsupported**. Crashes with FileNotFoundError or terminates silently |
+| **GitIgnore Pruning** | Dynamically reloads nested `.gitignore` files and supports the commonly used glob subset | Requires application-level filtering |
+| **Rename Sync** | Uses Linux cookies, Windows packets, FSEvents heuristics, and inode pairing in Polling | Backend-dependent |
+| **Overflow Resilience** | Emits `overflow`; Linux rebuilds its recursive watch tree after kernel overflow | Backend-dependent |
+| **Root Self-Healing** | Restarts the backend when watched roots disappear or reappear | Usually requires observer recreation |
 
 ---
 
@@ -64,10 +64,8 @@ def on_moved(event):
     print(f"📦 [MOVED]: {event.src_path} -> {event.dest_path}")
 
 # Start watching (blocks current thread; run in a separate thread if non-blocking is needed)
-try:
-    w.start()
-except KeyboardInterrupt:
-    w.stop()
+# Blocks until Ctrl+C or until another thread calls w.stop().
+w.start()
 ```
 
 ### 2. Level 2: One-Liner Callback
@@ -93,7 +91,7 @@ with FSWatcher("./watch_dir", debounce=0.05) as w:
 ```
 
 ### 4. Level 4: Async Native Iterator - ✨ Recommended
-Integrates seamlessly with modern async frameworks (FastAPI, Sanic, Tornado). Pure asyncio, zero extra threads.
+Integrates with modern async frameworks (FastAPI, Sanic, Tornado). Linux uses the caller's asyncio loop directly; Windows/macOS native backends use an OS-waiting helper thread.
 ```python
 import asyncio
 from yyds_fswatch import FSWatcher
@@ -107,26 +105,48 @@ async def main():
 asyncio.run(main())
 ```
 
+### Lifecycle, backpressure, and backend controls
+
+```python
+import threading
+from yyds_fswatch import FSWatcher
+
+w = FSWatcher(
+    "./watch_dir",
+    max_queue_size=4096,   # 0 opts into an unbounded queue
+    backend="auto",       # auto | native | polling
+    recovery_interval=2.0,
+)
+thread = threading.Thread(target=w.start)
+thread.start()
+w.wait_until_ready(timeout=5)
+
+# ...later
+w.stop()                  # public, idempotent, and thread-safe
+thread.join()
+```
+
+Use `target_type="file"` when a watched file does not exist yet. Set `ignore_common_dirs=False` when changes inside `dist`, `build`, `node_modules`, and other common generated directories must be reported.
+
 ---
 
 
 ## 🛡️ Deep Technical Optimization Details
 
-1. **Atomic Save Filtering**: For file watches (e.g. `data.json`), the system automatically monitors its parent directory and intercepts `MOVED_TO` and `CREATE` events. It filters out intermediate temporary files, guaranteeing that updates are $100\%$ captured regardless of the editor's write mechanism.
-2. **High-Performance Prefix Matching**: Bypasses the expensive `try-except ValueError` and `Path.resolve()` system calls during event filtering. Uses in-memory absolute path checks and precomputed string prefix matching to achieve a throughput of over **100,000 checks per second**.
-3. **Robust Lifecycle & Memory Safety**: When exiting standard/async loops or catching `KeyboardInterrupt`, the library cleanly shuts down async event queue hooks. Additionally, a `close()` mechanism is provided to purge the ignore filter's LRU cache and break cyclic references, allowing Python's GC to immediately collect resources.
-4. **System Buffer Overflow Prevention (Overflow Event)**: Under extreme file system activity, OS event queues can saturate (Linux `IN_Q_OVERFLOW` / Windows `ERROR_MORE_DATA`). The watcher handles these gracefully by emitting an `"overflow"` event and continuing monitoring, preventing locks or crash loops.
-5. **Hierarchical Nested `.gitignore` Support**: Automatically traverses and dynamically parses `.gitignore` files nested at any subdirectory depth, creating parent-child regex associations for precise, Git-compliant tree pruning.
+1. **Atomic Save Normalization**: For single-file watches (e.g. `data.json`), the system monitors the parent directory. A temporary file moved onto an existing target is emitted as `modified` on the target path.
+2. **Cached Path Filtering**: Absolute-root prefix checks and a bounded 4,096-entry decision cache reduce repeated filtering work. No unverified throughput number is claimed; benchmark on the intended directory tree and platform.
+3. **Lifecycle & Memory Controls**: Context managers and the public `stop()` method release backend resources. User-space queues are bounded to 4,096 events by default and emit `overflow` when consumers fall behind.
+4. **System Buffer Overflow Handling**: OS queue saturation emits an `overflow` event. Linux also recreates its inotify instance and recursive watch tree so missed directory registrations do not remain permanent.
+5. **Hierarchical Nested `.gitignore` Support**: Nested files are invalidated when they change. The built-in parser supports common `*`, `?`, `**`, anchoring, directory, and negation patterns; it is intentionally documented as a practical subset rather than byte-for-byte Git equivalence.
 6. **Self-Healing Root Recovery**: If a watched root directory is deleted or unmounted, the watcher pauses native OS watches and falls back to a low-overhead retry loop. Monitoring is automatically re-established the moment the path reappears.
 
 ---
 
-## 📈 Long-Term Resource Stability (Production Ready)
+## 📈 Resource and Long-Running Process Controls
 
-`yyds-fswatch` is designed for mission-critical, long-running daemon processes (e.g., chat bots, automated deployment monitors, web servers). It enforces strict resource bounds to run indefinitely (months/years) without memory drift or handle leaks:
+`yyds-fswatch` includes controls useful for long-running processes. Production adoption should still be validated on every target OS and file-system type:
 
-* **Bounded LRU Cache**: The `.gitignore` filter is backed by a cached lookup capped at a maximum of `4,096` entries (`lru_cache(maxsize=4096)`). Memory consumption remains constant ($O(1)$) and never leaks even when scanning millions of unique files.
-* **Idle CPU Overhead is $0.00\%$**: All native platform drivers (Linux `inotify`, macOS `FSEvents`, Windows `ReadDirectoryChangesW`) are event-driven and wait in the OS kernel until events occur. No polling threads or busy-waiting loops are active when idle.
+* **Bounded queues and cache**: Event queues and the `.gitignore` decision cache default to `4,096` entries. Backend descriptor maps naturally scale with the number of watched directories.
+* **Low idle overhead**: Native drivers wait on OS facilities. A lightweight lifecycle heartbeat supports prompt cross-thread shutdown, a configurable root-health probe runs every two seconds by default, and the Polling backend scans at its configured interval.
 * **Auto-Expiring State Machine**: Temporary states (such as rename cookie matching and debouncing queues) auto-expire and purge themselves within 50ms, maintaining a baseline size of zero when idle.
 * **Watches Pruning & Handle Safety**: Subdirectory watches are pruned dynamically at startup based on `.gitignore` rules (avoiding `ENOSPC` descriptor limits). System handles/file descriptors are synchronized dynamically when folders are deleted, and are safely closed upon stop.
-

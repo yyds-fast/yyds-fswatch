@@ -68,8 +68,16 @@ class LinuxWatcher(BaseWatcher):
         self._path_to_wd: Dict[Path, int] = {}
         self._buffer = b''
         self._move_cookies: Dict[int, Tuple[Path, float, bool]] = {}
+        self._ignored_wds_pending = set()
+        self._rebuild_scheduled = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._fd >= 0
 
     def start(self):
+        if self._fd >= 0:
+            raise RuntimeError("Linux watcher is already running")
         # 1. Initialize inotify instance
         self._fd = inotify_init()
         if self._fd < 0:
@@ -120,12 +128,16 @@ class LinuxWatcher(BaseWatcher):
         self._path_to_wd.clear()
         self._buffer = b''
         self._move_cookies.clear()
+        self._ignored_wds_pending.clear()
+        self._rebuild_scheduled = False
 
     def _register_path(self, path: Path):
         path = path.resolve()
+        if path in self._path_to_wd:
+            return
         if not path.is_dir():
             # Watch single file
-            wd = inotify_add_watch(self._fd, str(path).encode('utf-8'), InotifyMask.WATCH_MASK)
+            wd = inotify_add_watch(self._fd, os.fsencode(path), InotifyMask.WATCH_MASK)
             if wd < 0:
                 err = ctypes.get_errno()
                 raise OSError(err, f"inotify_add_watch failed for {path}: {os.strerror(err)}")
@@ -135,7 +147,7 @@ class LinuxWatcher(BaseWatcher):
 
         if not self.recursive:
             # Single directory
-            wd = inotify_add_watch(self._fd, str(path).encode('utf-8'), InotifyMask.WATCH_MASK)
+            wd = inotify_add_watch(self._fd, os.fsencode(path), InotifyMask.WATCH_MASK)
             if wd < 0:
                 err = ctypes.get_errno()
                 raise OSError(err, f"inotify_add_watch failed for {path}: {os.strerror(err)}")
@@ -158,7 +170,10 @@ class LinuxWatcher(BaseWatcher):
                     if not self._ignore_filter.is_ignored(dir_path / d, is_dir=True)
                 ]
 
-            wd = inotify_add_watch(self._fd, str(dir_path).encode('utf-8'), InotifyMask.WATCH_MASK)
+            if dir_path in self._path_to_wd:
+                continue
+
+            wd = inotify_add_watch(self._fd, os.fsencode(dir_path), InotifyMask.WATCH_MASK)
             if wd < 0:
                 err = ctypes.get_errno()
                 if err in (errno.ENOSPC, errno.EMFILE):
@@ -177,7 +192,13 @@ class LinuxWatcher(BaseWatcher):
                 self._buffer += data
             except BlockingIOError:
                 break
-            except OSError:
+            except OSError as exc:
+                if self._fd >= 0:
+                    self.stop()
+                    self.loop.call_exception_handler({
+                        "message": "yyds-fswatch inotify reader failed",
+                        "exception": exc,
+                    })
                 return
 
         offset = 0
@@ -192,7 +213,7 @@ class LinuxWatcher(BaseWatcher):
 
             # Extract name and strip padding nulls
             name_bytes = self._buffer[offset + header_size : offset + total_len]
-            name = name_bytes.rstrip(b'\x00').decode('utf-8', errors='replace')
+            name = os.fsdecode(name_bytes.rstrip(b'\x00'))
 
             self._dispatch_event(wd, mask, cookie, name)
             offset += total_len
@@ -203,6 +224,21 @@ class LinuxWatcher(BaseWatcher):
         if mask & InotifyMask.IN_Q_OVERFLOW:
             root_path = self.paths[0] if self.paths else Path('.')
             self.on_raw_event("overflow", root_path, is_dir=False)
+            if not self._rebuild_scheduled:
+                self._rebuild_scheduled = True
+                self.loop.call_soon(self._rebuild_watches)
+            return
+
+        # IN_IGNORED may arrive after we deliberately removed and unmapped a
+        # watch, so it must be handled before looking up the path.
+        if mask & InotifyMask.IN_IGNORED:
+            if wd in self._ignored_wds_pending:
+                self._ignored_wds_pending.discard(wd)
+                return
+            dir_path = self._wd_to_path.get(wd)
+            if dir_path in self._path_to_wd:
+                self._wd_to_path.pop(wd, None)
+                self._path_to_wd.pop(dir_path, None)
             return
 
         dir_path = self._wd_to_path.get(wd)
@@ -212,13 +248,7 @@ class LinuxWatcher(BaseWatcher):
         event_path = dir_path / name if name else dir_path
         is_dir = bool(mask & InotifyMask.IN_ISDIR)
 
-        # Handle IGNORED & DELETE_SELF
-        if mask & InotifyMask.IN_IGNORED:
-            # Clean up watch mappings
-            if dir_path in self._path_to_wd:
-                self._wd_to_path.pop(wd, None)
-                self._path_to_wd.pop(dir_path, None)
-            return
+        # Handle DELETE_SELF after resolving the watched path.
 
         if mask & InotifyMask.IN_DELETE_SELF:
             self.on_raw_event("deleted", dir_path, is_dir=True)
@@ -256,21 +286,14 @@ class LinuxWatcher(BaseWatcher):
                 
                 # Update watch mappings recursively for directory renames
                 if is_dir:
-                    if old_path in self._path_to_wd:
-                        wd = self._path_to_wd.pop(old_path)
-                        self._path_to_wd[event_path] = wd
-                        self._wd_to_path[wd] = event_path
-                        
-                    if self.recursive:
-                        for path in list(self._path_to_wd.keys()):
-                            try:
-                                rel_path = path.relative_to(old_path)
-                                new_sub_path = event_path / rel_path
-                                wd = self._path_to_wd.pop(path)
-                                self._path_to_wd[new_sub_path] = wd
-                                self._wd_to_path[wd] = new_sub_path
-                            except ValueError:
-                                continue
+                    destination_ignored = bool(
+                        self._ignore_filter and
+                        self._ignore_filter.is_ignored(event_path, is_dir=True)
+                    )
+                    if destination_ignored:
+                        self._remove_watch_subtree(old_path)
+                    else:
+                        self._rename_watch_subtree(old_path, event_path)
             else:
                 # Treat as created if no matching cookie
                 if is_dir and self.recursive:
@@ -285,3 +308,55 @@ class LinuxWatcher(BaseWatcher):
             old_path, _, is_dir = self._move_cookies.pop(cookie)
             # Cookie expired -> fallback to deleted event
             self.on_raw_event("deleted", old_path, is_dir)
+            if is_dir:
+                # inotify watches follow the inode when a directory is moved
+                # outside the root. Remove them or future events would be
+                # reported under stale paths outside the requested scope.
+                self._remove_watch_subtree(old_path)
+
+    def _rename_watch_subtree(self, old_path: Path, new_path: Path):
+        replacements = []
+        for watched_path, wd in list(self._path_to_wd.items()):
+            try:
+                relative = watched_path.relative_to(old_path)
+            except ValueError:
+                continue
+            replacements.append((watched_path, new_path / relative, wd))
+
+        for watched_path, new_watched_path, wd in replacements:
+            self._path_to_wd.pop(watched_path, None)
+            self._path_to_wd[new_watched_path] = wd
+            self._wd_to_path[wd] = new_watched_path
+
+    def _remove_watch_subtree(self, path: Path):
+        watches = []
+        for watched_path, wd in list(self._path_to_wd.items()):
+            try:
+                watched_path.relative_to(path)
+            except ValueError:
+                continue
+            watches.append((watched_path, wd))
+
+        for watched_path, wd in watches:
+            self._path_to_wd.pop(watched_path, None)
+            self._wd_to_path.pop(wd, None)
+            if self._fd >= 0:
+                self._ignored_wds_pending.add(wd)
+                inotify_rm_watch(self._fd, wd)
+
+    def _rebuild_watches(self):
+        """Reconcile recursive watches after the kernel queue overflowed."""
+        self._rebuild_scheduled = False
+        if self._fd < 0:
+            return
+        try:
+            # Recreate the inotify instance rather than reusing watch
+            # descriptors. Otherwise queued IN_IGNORED records for removed
+            # descriptors can race with descriptor-number reuse.
+            self.stop()
+            self.start()
+        except Exception as exc:
+            self.loop.call_exception_handler({
+                "message": "yyds-fswatch failed to rebuild inotify watches after overflow",
+                "exception": exc,
+            })
