@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Cancel Windows synchronous directory-change reads during shutdown so native
+  watcher threads do not wait for the close timeout.
+
 ## 0.2.2
 
 - Canonicalize event and ignore-rule paths so macOS `/var` and `/private/var`

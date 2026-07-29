@@ -32,6 +32,9 @@ FILE_NOTIFY_CHANGE_SIZE = 0x0008
 FILE_NOTIFY_CHANGE_ATTRIBUTES = 0x0004
 FILE_NOTIFY_CHANGE_CREATION = 0x0040
 
+# CancelSynchronousIo requires a thread handle opened with this access right.
+THREAD_TERMINATE = 0x0001
+
 NOTIFY_FILTER = (FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                  FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE |
                  FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_CREATION)
@@ -68,6 +71,18 @@ CloseHandle = kernel32.CloseHandle
 CloseHandle.argtypes = [wintypes.HANDLE]
 CloseHandle.restype = wintypes.BOOL
 
+GetCurrentThreadId = kernel32.GetCurrentThreadId
+GetCurrentThreadId.argtypes = []
+GetCurrentThreadId.restype = wintypes.DWORD
+
+OpenThread = kernel32.OpenThread
+OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+OpenThread.restype = wintypes.HANDLE
+
+CancelSynchronousIo = kernel32.CancelSynchronousIo
+CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+CancelSynchronousIo.restype = wintypes.BOOL
+
 class WindowsWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
                  on_raw_event: Callable, ignore_filter=None):
@@ -79,6 +94,8 @@ class WindowsWatcher(BaseWatcher):
         self._stop_event = threading.Event()
         self._directory_paths = set()
         self._dir_lock = threading.Lock()
+        self._worker_thread_ids = set()
+        self._worker_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -144,6 +161,8 @@ class WindowsWatcher(BaseWatcher):
         self._running = True
         self._stop_event = threading.Event()
         self._directory_paths.clear()
+        with self._worker_lock:
+            self._worker_thread_ids.clear()
         try:
             for path in self.paths:
                 path = path.resolve()
@@ -183,6 +202,21 @@ class WindowsWatcher(BaseWatcher):
     def stop(self):
         self._running = False
         self._stop_event.set()
+
+        # ReadDirectoryChangesW is issued synchronously in each worker. Closing
+        # its directory handle alone does not reliably unblock another thread's
+        # pending I/O, which used to make every watcher shutdown wait for the
+        # join timeout. Explicitly cancel the workers' synchronous I/O first.
+        with self._worker_lock:
+            worker_thread_ids = tuple(self._worker_thread_ids)
+        for thread_id in worker_thread_ids:
+            thread_handle = OpenThread(THREAD_TERMINATE, False, thread_id)
+            if thread_handle:
+                try:
+                    CancelSynchronousIo(thread_handle)
+                finally:
+                    CloseHandle(thread_handle)
+
         for h in self._handles:
             if h != INVALID_HANDLE_VALUE:
                 CloseHandle(h)
@@ -192,115 +226,125 @@ class WindowsWatcher(BaseWatcher):
         self._threads.clear()
         with self._dir_lock:
             self._directory_paths.clear()
+        with self._worker_lock:
+            self._worker_thread_ids.clear()
 
     def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path,
                       stop_event: threading.Event):
         buf = ctypes.create_string_buffer(65536)
         bytes_returned = wintypes.DWORD(0)
+        worker_thread_id = GetCurrentThreadId()
+
+        with self._worker_lock:
+            self._worker_thread_ids.add(worker_thread_id)
 
         # Win32 Error codes for overflow detection
         ERROR_MORE_DATA = 234
         ERROR_NOTIFY_ENUM_DIR = 1022
 
-        while not stop_event.is_set():
-            success = ReadDirectoryChangesW(
-                hDir,
-                buf,
-                ctypes.sizeof(buf),
-                self.recursive,
-                NOTIFY_FILTER,
-                ctypes.byref(bytes_returned),
-                None,
-                None
-            )
-            
-            if not success:
-                if stop_event.is_set():
-                    break
-                err = kernel32.GetLastError()
-                if err in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
-                    # Buffer overflow occurred
+        try:
+            while not stop_event.is_set():
+                success = ReadDirectoryChangesW(
+                    hDir,
+                    buf,
+                    ctypes.sizeof(buf),
+                    self.recursive,
+                    NOTIFY_FILTER,
+                    ctypes.byref(bytes_returned),
+                    None,
+                    None
+                )
+
+                if not success:
+                    if stop_event.is_set():
+                        break
+                    err = kernel32.GetLastError()
+                    if err in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
+                        # Buffer overflow occurred
+                        self.on_raw_event("overflow", watch_path, is_dir=False)
+                        continue
+                    else:
+                        exception = OSError(
+                            err,
+                            f"ReadDirectoryChangesW failed for {watch_path}: {ctypes.FormatError(err)}",
+                        )
+                        try:
+                            self.loop.call_soon_threadsafe(
+                                self.loop.call_exception_handler,
+                                {
+                                    "message": "yyds-fswatch Windows backend failed",
+                                    "exception": exception,
+                                },
+                            )
+                        except RuntimeError:
+                            pass
+                        break
+
+                if bytes_returned.value == 0:
+                    # Buffer overflow occurred (ReadDirectoryChangesW returns success but 0 bytes)
                     self.on_raw_event("overflow", watch_path, is_dir=False)
                     continue
-                else:
-                    exception = OSError(
-                        err,
-                        f"ReadDirectoryChangesW failed for {watch_path}: {ctypes.FormatError(err)}",
-                    )
-                    try:
-                        self.loop.call_soon_threadsafe(
-                            self.loop.call_exception_handler,
-                            {
-                                "message": "yyds-fswatch Windows backend failed",
-                                "exception": exception,
-                            },
-                        )
-                    except RuntimeError:
-                        pass
-                    break
-            
-            if bytes_returned.value == 0:
-                # Buffer overflow occurred (ReadDirectoryChangesW returns success but 0 bytes)
-                self.on_raw_event("overflow", watch_path, is_dir=False)
-                continue
 
-            events_in_packet = []
-            offset = 0
-            while True:
-                if offset + 12 > bytes_returned.value:
-                    break
-                    
-                next_offset, action, name_len = struct.unpack_from("III", buf.raw, offset)
-                if offset + 12 + name_len > bytes_returned.value:
-                    break
-                    
-                name_bytes = buf.raw[offset + 12 : offset + 12 + name_len]
-                name = name_bytes.decode('utf-16le', errors='replace')
-                
-                event_path = watch_path / name
-                events_in_packet.append((action, event_path))
-                
-                if next_offset == 0:
-                    break
-                offset += next_offset
+                events_in_packet = []
+                offset = 0
+                while True:
+                    if offset + 12 > bytes_returned.value:
+                        break
 
-            i = 0
-            n = len(events_in_packet)
-            while i < n:
-                action, event_path = events_in_packet[i]
-                
-                if action == 4: # RENAMED_OLD_NAME
-                    if i + 1 < n and events_in_packet[i+1][0] == 5:
-                        next_action, next_path = events_in_packet[i+1]
-                        is_dir = self._is_path_directory(event_path)
+                    next_offset, action, name_len = struct.unpack_from("III", buf.raw, offset)
+                    if offset + 12 + name_len > bytes_returned.value:
+                        break
+
+                    name_bytes = buf.raw[offset + 12 : offset + 12 + name_len]
+                    name = name_bytes.decode('utf-16le', errors='replace')
+
+                    event_path = watch_path / name
+                    events_in_packet.append((action, event_path))
+
+                    if next_offset == 0:
+                        break
+                    offset += next_offset
+
+                i = 0
+                n = len(events_in_packet)
+                while i < n:
+                    action, event_path = events_in_packet[i]
+
+                    if action == 4: # RENAMED_OLD_NAME
+                        if i + 1 < n and events_in_packet[i+1][0] == 5:
+                            next_action, next_path = events_in_packet[i+1]
+                            is_dir = self._is_path_directory(event_path)
+                            if is_dir:
+                                self._rename_directory_in_set(event_path, next_path)
+                            self.on_raw_event("moved", event_path, is_dir, dest_path=next_path)
+                            i += 2
+                        else:
+                            is_dir = self._is_path_directory(event_path)
+                            self.on_raw_event("deleted", event_path, is_dir)
+                            i += 1
+                    elif action == 5: # RENAMED_NEW_NAME
+                        is_dir = event_path.is_dir() if event_path.exists() else False
                         if is_dir:
-                            self._rename_directory_in_set(event_path, next_path)
-                        self.on_raw_event("moved", event_path, is_dir, dest_path=next_path)
-                        i += 2
-                    else:
+                            self._add_directory_recursive_to_set(event_path)
+                        self.on_raw_event("created", event_path, is_dir)
+                        i += 1
+                    elif action == 1: # ADDED
+                        is_dir = event_path.is_dir() if event_path.exists() else False
+                        if is_dir:
+                            self._add_directory_recursive_to_set(event_path)
+                        self.on_raw_event("created", event_path, is_dir)
+                        i += 1
+                    elif action == 2: # REMOVED
                         is_dir = self._is_path_directory(event_path)
+                        self._remove_directory_from_set(event_path)
                         self.on_raw_event("deleted", event_path, is_dir)
                         i += 1
-                elif action == 5: # RENAMED_NEW_NAME
-                    is_dir = event_path.is_dir() if event_path.exists() else False
-                    if is_dir:
-                        self._add_directory_recursive_to_set(event_path)
-                    self.on_raw_event("created", event_path, is_dir)
-                    i += 1
-                elif action == 1: # ADDED
-                    is_dir = event_path.is_dir() if event_path.exists() else False
-                    if is_dir:
-                        self._add_directory_recursive_to_set(event_path)
-                    self.on_raw_event("created", event_path, is_dir)
-                    i += 1
-                elif action == 2: # REMOVED
-                    is_dir = self._is_path_directory(event_path)
-                    self._remove_directory_from_set(event_path)
-                    self.on_raw_event("deleted", event_path, is_dir)
-                    i += 1
-                elif action == 3: # MODIFIED
-                    is_dir = event_path.is_dir() if event_path.exists() else False
-                    self.on_raw_event("modified", event_path, is_dir)
-                    i += 1
-                else:
-                    i += 1
+                    elif action == 3: # MODIFIED
+                        is_dir = event_path.is_dir() if event_path.exists() else False
+                        self.on_raw_event("modified", event_path, is_dir)
+                        i += 1
+                    else:
+                        i += 1
+        finally:
+            with self._worker_lock:
+                self._worker_thread_ids.discard(worker_thread_id)

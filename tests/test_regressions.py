@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -38,6 +39,40 @@ class TestFSWatcherRegressions(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertFalse(watcher.is_ready)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows-specific regression")
+    def test_windows_native_stop_cancels_blocking_read(self):
+        async def run():
+            watcher = FSWatcher(
+                self.root,
+                backend="native",
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            )
+            entered = False
+            try:
+                await watcher.__aenter__()
+                entered = True
+                backend = watcher._watcher
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while not backend._worker_thread_ids:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(backend._worker_thread_ids)
+
+                # Give the worker a chance to enter ReadDirectoryChangesW.
+                await asyncio.sleep(0.05)
+                started = time.monotonic()
+                await watcher.__aexit__(None, None, None)
+                entered = False
+                return time.monotonic() - started
+            finally:
+                if entered:
+                    await watcher.__aexit__(None, None, None)
+
+        elapsed = asyncio.run(run())
+        self.assertLess(elapsed, 0.75)
 
     def test_missing_file_can_be_declared_explicitly(self):
         target = self.root / "future.txt"
