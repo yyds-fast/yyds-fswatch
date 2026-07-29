@@ -2,6 +2,7 @@
 
 import os
 import re
+import stat
 from functools import lru_cache
 from pathlib import Path
 from typing import List
@@ -44,7 +45,6 @@ class GitIgnoreFilter:
 
         self._dir_rules = {}
         self._checked_dirs = set()
-        self._gitignore_signatures = {}
 
         # Binding a bounded cache per instance keeps repeated hot-path checks
         # fast. close() explicitly breaks the bound-method reference cycle.
@@ -57,13 +57,11 @@ class GitIgnoreFilter:
             self.is_ignored = None
         self._dir_rules.clear()
         self._checked_dirs.clear()
-        self._gitignore_signatures.clear()
 
     def refresh(self):
         """Forget loaded rule files and cached decisions, reloading lazily."""
         self._dir_rules.clear()
         self._checked_dirs.clear()
-        self._gitignore_signatures.clear()
         if self.is_ignored is not None:
             self.is_ignored.cache_clear()
 
@@ -92,7 +90,6 @@ class GitIgnoreFilter:
     def _invalidate_directory(self, directory: Path):
         directory = directory.absolute()
         self._checked_dirs.discard(directory)
-        self._gitignore_signatures.pop(directory, None)
         self._dir_rules.pop(directory, None)
 
     def _purge_subtree(self, path: Path):
@@ -104,7 +101,6 @@ class GitIgnoreFilter:
             except ValueError:
                 continue
             self._checked_dirs.discard(directory)
-            self._gitignore_signatures.pop(directory, None)
             self._dir_rules.pop(directory, None)
 
     def _find_root(self, path: Path):
@@ -131,23 +127,23 @@ class GitIgnoreFilter:
                 break
             current = current.parent
 
-        rules_changed = False
         for ancestor in reversed(ancestors):
-            gitignore_file = ancestor / ".gitignore"
-            try:
-                stat = gitignore_file.stat()
-                signature = (stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                signature = None
-
-            already_checked = ancestor in self._checked_dirs
-            if already_checked and self._gitignore_signatures.get(ancestor) == signature:
+            if ancestor in self._checked_dirs:
+                # File-system events explicitly invalidate changed rule files.
+                # Avoid a stat of every ancestor for every distinct path in a
+                # large tree; that otherwise turns filtering into O(depth)
+                # extra filesystem calls per entry.
                 continue
 
+            gitignore_file = ancestor / ".gitignore"
+            try:
+                gitignore_stat = gitignore_file.stat()
+            except OSError:
+                gitignore_stat = None
+
             self._checked_dirs.add(ancestor)
-            self._gitignore_signatures[ancestor] = signature
             rules = []
-            if signature is not None and gitignore_file.is_file():
+            if gitignore_stat is not None and stat.S_ISREG(gitignore_stat.st_mode):
                 try:
                     with open(gitignore_file, "r", encoding="utf-8", errors="ignore") as file:
                         for line in file:
@@ -162,12 +158,6 @@ class GitIgnoreFilter:
                 self._dir_rules[ancestor] = rules
             else:
                 self._dir_rules.pop(ancestor, None)
-            rules_changed = rules_changed or already_checked
-
-        # An event normally clears the cache before this method is reached.
-        # The signature check also covers direct filter users and missed events.
-        if rules_changed and self.is_ignored is not None:
-            self.is_ignored.cache_clear()
 
     def _add_rule_to_list(self, pattern: str, rule_list: list):
         is_negated = pattern.startswith("!")

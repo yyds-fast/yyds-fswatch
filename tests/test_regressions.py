@@ -117,6 +117,34 @@ class TestFSWatcherRegressions(unittest.TestCase):
         self.assertEqual(event.event_type, "overflow")
         self.assertEqual(dropped, 1)
 
+    def test_event_loop_raw_events_skip_threadsafe_schedule(self):
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                loop = asyncio.get_running_loop()
+                original_schedule = loop.call_soon_threadsafe
+                calls = []
+
+                def record_threadsafe_schedule(*args, **kwargs):
+                    calls.append((args, kwargs))
+
+                loop.call_soon_threadsafe = record_threadsafe_schedule
+                try:
+                    target = self.root / "direct-loop-event.txt"
+                    watcher._on_raw_event("created", target, False)
+                    self.assertEqual(calls, [])
+                    return await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                finally:
+                    loop.call_soon_threadsafe = original_schedule
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "created")
+        self.assertEqual(Path(event.src_path).name, "direct-loop-event.txt")
+
     def test_stop_sentinel_survives_a_full_queue(self):
         async def run():
             async with FSWatcher(
@@ -184,6 +212,139 @@ class TestFSWatcherRegressions(unittest.TestCase):
         self.assertTrue(running)
         self.assertTrue(root_registered)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify-specific regression")
+    def test_linux_recovers_after_root_is_recreated_between_probes(self):
+        """A valid inotify fd must not hide a dropped root watch."""
+        target = self.root / "after-recreate.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0,
+                recovery_interval=0.02,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+
+                # The root exists again before the recovery loop's first
+                # probe, so path-existence checks alone cannot detect loss of
+                # the original inotify watch.
+                await asyncio.sleep(0.08)
+                target.write_text("recreated", encoding="utf-8")
+
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.2)
+                    if Path(event.src_path) == target:
+                        return event
+                self.fail("recreated root did not resume file events")
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "created")
+
+    def test_polling_close_keeps_event_loop_responsive(self):
+        async def run():
+            watcher = FSWatcher(
+                self.root,
+                backend="polling",
+                poll_interval=0.01,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            )
+            await watcher.__aenter__()
+            entered = True
+            release_scan = threading.Event()
+            scan_started = threading.Event()
+            release_timer = None
+
+            try:
+                backend = watcher._watcher
+                original_scan = backend._scan
+
+                def slow_scan():
+                    scan_started.set()
+                    release_scan.wait(timeout=1.0)
+                    return original_scan()
+
+                backend._scan = slow_scan
+                for _ in range(30):
+                    if scan_started.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(scan_started.is_set())
+
+                tick_before_release = []
+                loop = asyncio.get_running_loop()
+                loop.call_later(
+                    0.02,
+                    lambda: tick_before_release.append(not release_scan.is_set()),
+                )
+                release_timer = threading.Timer(0.15, release_scan.set)
+                release_timer.daemon = True
+                release_timer.start()
+
+                await watcher.__aexit__(None, None, None)
+                entered = False
+                return tick_before_release
+            finally:
+                release_scan.set()
+                if release_timer is not None:
+                    release_timer.cancel()
+                if entered:
+                    await watcher.__aexit__(None, None, None)
+
+        ticks = asyncio.run(run())
+        self.assertEqual(ticks, [True])
+
+    def test_polling_initial_scan_keeps_event_loop_responsive(self):
+        async def run():
+            watcher = FSWatcher(
+                self.root,
+                backend="polling",
+                poll_interval=0.01,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            )
+            release_scan = threading.Event()
+            scan_started = threading.Event()
+            release_timer = None
+            entered = False
+            original_scan = PollingWatcher._scan
+
+            def slow_scan(backend):
+                scan_started.set()
+                release_scan.wait(timeout=1.0)
+                return original_scan(backend)
+
+            PollingWatcher._scan = slow_scan
+            try:
+                tick_before_release = []
+                loop = asyncio.get_running_loop()
+                loop.call_later(
+                    0.02,
+                    lambda: tick_before_release.append(not release_scan.is_set()),
+                )
+                release_timer = threading.Timer(0.15, release_scan.set)
+                release_timer.daemon = True
+                release_timer.start()
+
+                await watcher.__aenter__()
+                entered = True
+                self.assertTrue(scan_started.is_set())
+                return tick_before_release
+            finally:
+                PollingWatcher._scan = original_scan
+                release_scan.set()
+                if release_timer is not None:
+                    release_timer.cancel()
+                if entered:
+                    await watcher.__aexit__(None, None, None)
+
+        ticks = asyncio.run(run())
+        self.assertEqual(ticks, [True])
+
     def test_polling_diff_detects_directory_move_once(self):
         old_dir = self.root / "old"
         new_dir = self.root / "new"
@@ -209,6 +370,39 @@ class TestFSWatcherRegressions(unittest.TestCase):
         args, kwargs = events[0]
         self.assertEqual(args[:3], ("moved", old_dir, True))
         self.assertEqual(kwargs["dest_path"], new_dir)
+
+    def test_polling_diff_orders_tree_events(self):
+        parent = self.root / "parent"
+        child = parent / "child.txt"
+        root_state = (1, 0, True, 1, 1)
+        parent_state = (1, 0, True, 1, 2)
+        child_state = (1, 1, False, 1, 3)
+        events = []
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        watcher = PollingWatcher(
+            [self.root], True, loop,
+            lambda event_type, path, is_dir, **kwargs: events.append((event_type, path)),
+        )
+
+        watcher._diff(
+            {self.root: root_state, parent: parent_state, child: child_state},
+            {self.root: root_state},
+        )
+        self.assertEqual(
+            events,
+            [("deleted", child), ("deleted", parent)],
+        )
+
+        events.clear()
+        watcher._diff(
+            {self.root: root_state},
+            {self.root: root_state, parent: parent_state, child: child_state},
+        )
+        self.assertEqual(
+            events,
+            [("created", parent), ("created", child)],
+        )
 
     def test_forced_polling_backend_detects_move(self):
         old_path = self.root / "old.txt"

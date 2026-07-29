@@ -63,6 +63,33 @@ class TestGitIgnoreFilter(unittest.TestCase):
         self.assertEqual(info.hits, 1)
         self.assertEqual(info.misses, 1)
 
+    def test_checked_gitignore_ancestors_are_not_restatted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            filt = GitIgnoreFilter(
+                root_paths=[root],
+                use_gitignore=True,
+                ignore_common_dirs=False,
+            )
+            original_stat = Path.stat
+            stat_calls = []
+
+            def counted_stat(path, *args, **kwargs):
+                stat_calls.append(path)
+                return original_stat(path, *args, **kwargs)
+
+            Path.stat = counted_stat
+            try:
+                self.assertFalse(filt.is_ignored(root / "nested" / "first.txt"))
+                first_call_count = len(stat_calls)
+                self.assertFalse(filt.is_ignored(root / "nested" / "second.txt"))
+            finally:
+                Path.stat = original_stat
+                filt.close()
+
+            self.assertGreater(first_call_count, 0)
+            self.assertEqual(len(stat_calls), first_call_count)
+
     def test_dynamic_gitignore_invalidation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

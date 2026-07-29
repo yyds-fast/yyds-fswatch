@@ -226,9 +226,6 @@ class FSWatcher:
         # Put final sentinel just in case.
         if self._sync_queue is not None:
             self._force_sync_put(_STOP_SENTINEL)
-        if self._ignore_filter:
-            self._ignore_filter.close()
-            self._ignore_filter = None
 
     def _run_bg_loop(self):
         self._bg_loop = asyncio.new_event_loop()
@@ -303,7 +300,7 @@ class FSWatcher:
             self._watcher = self._create_platform_watcher(watcher_cls)
 
             if self._existing_paths():
-                self._start_platform_watcher()
+                await self._start_platform_watcher()
 
             self.is_ready = True
             self._ready_event.set()
@@ -317,7 +314,7 @@ class FSWatcher:
             self._ready_event.set()
             if self._watcher is not None:
                 try:
-                    self._watcher.stop()
+                    await self._stop_platform_watcher()
                 except Exception:
                     pass
                 self._watcher = None
@@ -345,15 +342,15 @@ class FSWatcher:
         self._backend_name = watcher_cls.__name__
         return watcher
 
-    def _start_platform_watcher(self):
+    async def _start_platform_watcher(self):
         try:
-            self._watcher.start()
+            await self._watcher.astart()
         except Exception as exc:
             from ._platforms._polling import PollingWatcher
             if self.backend_preference != "auto" or isinstance(self._watcher, PollingWatcher):
                 raise
             try:
-                self._watcher.stop()
+                await self._watcher.aclose()
             except Exception:
                 pass
             warnings.warn(
@@ -363,7 +360,12 @@ class FSWatcher:
                 stacklevel=2,
             )
             self._watcher = self._create_platform_watcher(PollingWatcher)
-            self._watcher.start()
+            await self._watcher.astart()
+
+    async def _stop_platform_watcher(self):
+        """Stop a backend without blocking the caller's asyncio loop."""
+        if self._watcher is not None:
+            await self._watcher.aclose()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         self.is_ready = False
@@ -390,7 +392,7 @@ class FSWatcher:
 
         if self._watcher:
             try:
-                self._watcher.stop()
+                await self._stop_platform_watcher()
             except Exception as exc:
                 self._loop.call_exception_handler({
                     "message": "yyds-fswatch backend cleanup failed",
@@ -428,18 +430,18 @@ class FSWatcher:
                 current_paths = self._existing_paths()
 
                 backend_healthy = bool(
-                    self._watcher and getattr(self._watcher, "is_running", False)
+                    self._watcher and self._watcher.is_healthy_for(current_paths)
                 )
                 if current_paths and watcher_running and not backend_healthy:
                     try:
-                        self._watcher.stop()
+                        await self._stop_platform_watcher()
                     except Exception:
                         pass
                     watcher_running = False
 
                 if current_paths != existing_paths and watcher_running:
                     if self._watcher:
-                        self._watcher.stop()
+                        await self._stop_platform_watcher()
                     watcher_running = False
 
                 if current_paths != existing_paths and self._ignore_filter:
@@ -448,7 +450,7 @@ class FSWatcher:
                 if current_paths and not watcher_running:
                     if self._watcher:
                         try:
-                            self._start_platform_watcher()
+                            await self._start_platform_watcher()
                             watcher_running = True
                         except Exception as exc:
                             self._loop.call_exception_handler({
@@ -482,12 +484,29 @@ class FSWatcher:
         """Called by the platform watcher when a change is detected."""
         if self._loop is None or self._loop.is_closed():
             return
+        try:
+            if asyncio.get_running_loop() is self._loop:
+                # Linux's add_reader callback and PollingWatcher's diff both
+                # already execute on the target loop. Avoid the lock and
+                # self-pipe write performed by call_soon_threadsafe for every
+                # event in those hot paths.
+                self._push_to_debounce(event_type, path, is_dir, dest_path)
+                return
+        except RuntimeError:
+            # Native Windows/macOS callbacks run in helper threads without a
+            # running asyncio loop and must take the thread-safe path below.
+            pass
         self._loop.call_soon_threadsafe(self._push_to_debounce, event_type, path, is_dir, dest_path)
 
     def _push_to_debounce(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
         if not self.is_ready or self._stop_requested.is_set():
             return
         if event_type == "overflow":
+            # An overflow means changes to nested .gitignore files may have
+            # been missed. Drop rule state before the backend reconciles its
+            # watches so subsequent visibility checks reload current rules.
+            if self._ignore_filter:
+                self._ignore_filter.refresh()
             # Flush all pending events first to preserve order
             for p in list(self._pending_events.keys()):
                 self._flush_event(p)

@@ -75,6 +75,21 @@ class LinuxWatcher(BaseWatcher):
     def is_running(self) -> bool:
         return self._fd >= 0
 
+    def is_healthy_for(self, paths: List[Path]) -> bool:
+        """Check both the inotify instance and coverage of requested roots.
+
+        An inotify fd remains valid after a watched root is removed, while the
+        kernel drops that root's watch and sends ``IN_IGNORED``. Treating the
+        fd alone as healthy leaves a rapidly recreated root permanently
+        unwatched.
+        """
+        if not self.is_running:
+            return False
+        return all(
+            not path.exists() or path.resolve() in self._path_to_wd
+            for path in paths
+        )
+
     def start(self):
         if self._fd >= 0:
             raise RuntimeError("Linux watcher is already running")

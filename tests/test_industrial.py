@@ -99,6 +99,23 @@ class TestFSWatcherIndustrial(unittest.TestCase):
         self.assertEqual(events[0].event_type, "modified")
         self.assertEqual(events[1].event_type, "overflow")
 
+    def test_overflow_refreshes_gitignore_rules(self):
+        target = self.test_dir / "newly-ignored.log"
+        gitignore = self.test_dir / ".gitignore"
+
+        async def run_test():
+            async with FSWatcher(
+                self.test_dir,
+                use_gitignore=True,
+                ignore_common_dirs=False,
+            ) as watcher:
+                self.assertFalse(watcher._ignore_filter.is_ignored(target))
+                gitignore.write_text("*.log\n", encoding="utf-8")
+                watcher._push_to_debounce("overflow", self.test_dir, False)
+                return watcher._ignore_filter.is_ignored(target)
+
+        self.assertTrue(asyncio.run(run_test()))
+
     def test_root_recovery(self):
         watcher = FSWatcher(self.test_dir, debounce=0.05, recovery_interval=0.05)
         events = []
