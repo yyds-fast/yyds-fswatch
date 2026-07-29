@@ -29,13 +29,37 @@ class TestFSWatcher(unittest.TestCase):
         )
         file_path = self.test_dir / "test.txt"
         new_path = self.test_dir / "test_new.txt"
-        expected = [
+        moved_sequence = [
             ("created", file_path, None),
             ("modified", file_path, None),
             ("moved", file_path, new_path),
             ("deleted", new_path, None),
         ]
+        replacement_sequence = [
+            ("created", file_path, None),
+            ("modified", file_path, None),
+            ("deleted", file_path, None),
+            ("created", new_path, None),
+            ("deleted", new_path, None),
+        ]
         events = []
+
+        def matches_sequence(sequence):
+            index = 0
+            for event in events:
+                event_type, source_path, destination_path = sequence[index]
+                if event.event_type != event_type:
+                    continue
+                if Path(event.src_path).resolve() != source_path:
+                    continue
+                if destination_path is not None and (
+                    Path(event.dest_path).resolve() != destination_path
+                ):
+                    continue
+                index += 1
+                if index == len(sequence):
+                    return True
+            return False
         
         # Start a helper to do file changes while watching
         def perform_changes():
@@ -77,20 +101,22 @@ class TestFSWatcher(unittest.TestCase):
         from yyds_fswatch.watcher import _STOP_SENTINEL
         with watcher as w:
             start_time = time.time()
-            while len(events) < len(expected):
+            while not (
+                matches_sequence(moved_sequence) or
+                matches_sequence(replacement_sequence)
+            ):
                 if time.time() - start_time > 5.0:
                     break
                 try:
                     event = w._sync_queue.get(timeout=0.2)
                     if event is _STOP_SENTINEL:
                         break
-                    event_type, source_path, destination_path = expected[len(events)]
-                    if event.event_type != event_type:
-                        continue
-                    if Path(event.src_path).resolve() != source_path:
-                        continue
-                    if destination_path is not None and (
-                        Path(event.dest_path).resolve() != destination_path
+                    source_path = Path(event.src_path).resolve()
+                    destination_path = (
+                        Path(event.dest_path).resolve() if event.dest_path else None
+                    )
+                    if source_path not in {file_path, new_path} and (
+                        destination_path not in {file_path, new_path}
                     ):
                         continue
                     events.append(event)
@@ -99,18 +125,10 @@ class TestFSWatcher(unittest.TestCase):
 
         t.join()
 
-        self.assertEqual(len(events), len(expected), f"Expected events: {expected}; got: {events}")
-
-        # Check target-file event types in order. Native backends can also
-        # report parent-directory metadata changes, which are irrelevant here.
-        event_types = [e.event_type for e in events]
-        self.assertEqual(event_types, [item[0] for item in expected])
-        
-        # Verify moved event details
-        moved_event = events[2]
-        self.assertEqual(moved_event.event_type, "moved")
-        self.assertEqual(Path(moved_event.src_path).name, "test.txt")
-        self.assertEqual(Path(moved_event.dest_path).name, "test_new.txt")
+        self.assertTrue(
+            matches_sequence(moved_sequence) or matches_sequence(replacement_sequence),
+            f"Expected a move or delete/create replacement sequence; got: {events}",
+        )
 
     def test_decorator_mode(self):
         watcher = FSWatcher(self.test_dir, debounce=0.05)

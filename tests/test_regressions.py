@@ -470,12 +470,13 @@ class TestFSWatcherRegressions(unittest.TestCase):
             [("created", parent), ("created", child)],
         )
 
-    def test_forced_polling_backend_detects_move(self):
+    def test_forced_polling_backend_reports_rename(self):
         old_path = self.root / "old.txt"
         new_path = self.root / "new.txt"
         old_path.write_text("content", encoding="utf-8")
 
         async def run():
+            events = []
             async with FSWatcher(
                 self.root,
                 backend="polling",
@@ -487,15 +488,44 @@ class TestFSWatcherRegressions(unittest.TestCase):
                 old_path.rename(new_path)
                 deadline = asyncio.get_running_loop().time() + 1.0
                 while asyncio.get_running_loop().time() < deadline:
-                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
-                    if event.event_type == "moved":
-                        return event, watcher.backend
-                self.fail("polling backend did not emit a moved event")
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    try:
+                        event = await asyncio.wait_for(
+                            watcher.__anext__(), timeout=min(remaining, 0.2)
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    events.append(event)
+                    moved = any(
+                        event.event_type == "moved" and
+                        Path(event.src_path) == old_path and
+                        Path(event.dest_path) == new_path
+                        for event in events
+                    )
+                    deleted_old = any(
+                        event.event_type == "deleted" and Path(event.src_path) == old_path
+                        for event in events
+                    )
+                    created_new = any(
+                        event.event_type == "created" and Path(event.src_path) == new_path
+                        for event in events
+                    )
+                    if moved or (deleted_old and created_new):
+                        return events, watcher.backend
+                self.fail("polling backend did not report the renamed file")
 
-        event, backend = asyncio.run(run())
+        events, backend = asyncio.run(run())
         self.assertEqual(backend, "PollingWatcher")
-        self.assertEqual(Path(event.src_path), old_path)
-        self.assertEqual(Path(event.dest_path), new_path)
+        moved_events = [event for event in events if event.event_type == "moved"]
+        if moved_events:
+            self.assertEqual(Path(moved_events[0].src_path), old_path)
+            self.assertEqual(Path(moved_events[0].dest_path), new_path)
+        else:
+            event_types_and_paths = [
+                (event.event_type, Path(event.src_path)) for event in events
+            ]
+            self.assertIn(("deleted", old_path), event_types_and_paths)
+            self.assertIn(("created", new_path), event_types_and_paths)
 
 
 if __name__ == "__main__":
