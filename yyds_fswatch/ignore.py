@@ -88,12 +88,12 @@ class GitIgnoreFilter:
             self.is_ignored.cache_clear()
 
     def _invalidate_directory(self, directory: Path):
-        directory = directory.absolute()
+        directory = directory.resolve()
         self._checked_dirs.discard(directory)
         self._dir_rules.pop(directory, None)
 
     def _purge_subtree(self, path: Path):
-        path = path.absolute()
+        path = path.resolve()
         directories = set(self._checked_dirs) | set(self._dir_rules)
         for directory in directories:
             try:
@@ -114,7 +114,7 @@ class GitIgnoreFilter:
         if not self._use_gitignore:
             return
 
-        resolved_dir = dir_path.absolute()
+        resolved_dir = dir_path.resolve()
         root_path = self._find_root(resolved_dir)
         if root_path is None:
             return
@@ -221,7 +221,10 @@ class GitIgnoreFilter:
         return True
 
     def _is_ignored_impl(self, path: Path, is_dir: bool = False) -> bool:
-        resolved_path = path.absolute()
+        # Roots are resolved at construction time. Resolve every lookup as
+        # well so macOS aliases such as /var and /private/var remain in the
+        # same namespace instead of being mistaken for out-of-scope paths.
+        resolved_path = path.resolve()
         root_path = self._find_root(resolved_path)
         if root_path is None:
             return True

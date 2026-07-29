@@ -77,13 +77,32 @@ class TestFSWatcherRegressions(unittest.TestCase):
         self.assertEqual(Path(event.src_path), target)
         self.assertEqual(event.dest_path, "")
 
+    def test_existing_file_created_event_is_normalized_to_modified(self):
+        target = self.root / "target.txt"
+        target.write_text("old", encoding="utf-8")
+
+        async def run():
+            async with FSWatcher(
+                target,
+                debounce=0,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                watcher._on_raw_event("created", target, False)
+                return await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "modified")
+        self.assertEqual(Path(event.src_path), target)
+
     def test_mixed_directory_and_file_targets_keep_directory_events(self):
         selected = self.root / "selected.txt"
         selected.write_text("old", encoding="utf-8")
         other = self.root / "other.txt"
 
         async def run():
-            events = []
+            expected_paths = {selected, other}
+            events = {}
             async with FSWatcher(
                 [self.root, selected],
                 debounce=0.01,
@@ -92,12 +111,24 @@ class TestFSWatcherRegressions(unittest.TestCase):
             ) as watcher:
                 other.write_text("other", encoding="utf-8")
                 selected.write_text("new", encoding="utf-8")
-                while len(events) < 2:
-                    events.append(await asyncio.wait_for(watcher.__anext__(), timeout=1.0))
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while expected_paths - set(events):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        event = await asyncio.wait_for(watcher.__anext__(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    event_path = Path(event.src_path).resolve()
+                    if event_path in expected_paths:
+                        events[event_path] = event
             return events
 
         events = asyncio.run(run())
-        self.assertEqual({Path(event.src_path) for event in events}, {selected, other})
+        self.assertEqual(set(events), {selected, other}, f"Expected file events, got: {events}")
+        self.assertEqual(events[other].event_type, "created")
+        self.assertEqual(events[selected].event_type, "modified")
 
     def test_bounded_queue_emits_overflow(self):
         async def run():

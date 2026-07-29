@@ -520,8 +520,11 @@ class FSWatcher:
             self._emit_event(event)
             return
 
-        path = Path(path).absolute()
-        dest_path = Path(dest_path).absolute() if dest_path else None
+        # Watch targets are canonicalized at construction.  Do the same for
+        # backend paths so macOS aliases such as /var and /private/var do not
+        # make an otherwise in-scope event look unrelated to its target.
+        path = Path(path).resolve()
+        dest_path = Path(dest_path).resolve() if dest_path else None
 
         if self._ignore_filter:
             self._ignore_filter.notify_event(event_type, path, is_dir, dest_path)
@@ -545,6 +548,16 @@ class FSWatcher:
                 return
         elif not source_visible:
             return
+
+        # FSEvents and ReadDirectoryChangesW can surface an atomic replacement
+        # as a plain creation of an already watched file. Preserve the public
+        # replacement semantics by reporting it as a modification.
+        if (
+            event_type == "created" and
+            path in self._file_targets and
+            self._file_target_present.get(path, False)
+        ):
+            event_type = "modified"
 
         self._update_file_target_state(event_type, path, dest_path)
 
@@ -602,7 +615,7 @@ class FSWatcher:
         return True
 
     def _is_path_in_scope(self, path: Path) -> bool:
-        path = Path(path).absolute()
+        path = Path(path).resolve()
         if path in self._file_targets:
             return True
         for root in self._directory_targets:
@@ -653,7 +666,7 @@ class FSWatcher:
             self._force_async_put(self._make_backpressure_overflow_event())
 
     def _make_backpressure_overflow_event(self):
-        root = self.paths[0] if self.paths else Path(".").absolute()
+        root = self.paths[0] if self.paths else Path(".").resolve()
         return FSEvent("overflow", str(root), is_directory=False)
 
     def _force_async_put(self, item):

@@ -75,7 +75,8 @@ class TestGitIgnoreFilter(unittest.TestCase):
             stat_calls = []
 
             def counted_stat(path, *args, **kwargs):
-                stat_calls.append(path)
+                if path.name == ".gitignore":
+                    stat_calls.append(path)
                 return original_stat(path, *args, **kwargs)
 
             Path.stat = counted_stat

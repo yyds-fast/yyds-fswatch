@@ -18,7 +18,14 @@ class TestFSWatcher(unittest.TestCase):
 
     def test_sync_iterator_and_debounce(self):
         watcher = FSWatcher(self.test_dir, debounce=0.1)
-        
+        file_path = self.test_dir / "test.txt"
+        new_path = self.test_dir / "test_new.txt"
+        expected = [
+            ("created", file_path, None),
+            ("modified", file_path, None),
+            ("moved", file_path, new_path),
+            ("deleted", new_path, None),
+        ]
         events = []
         
         # Start a helper to do file changes while watching
@@ -29,8 +36,6 @@ class TestFSWatcher(unittest.TestCase):
                     break
                 time.sleep(0.1)
             time.sleep(0.1)  # Extra buffer to ensure loop is active
-            
-            file_path = self.test_dir / "test.txt"
             
             # 1. Create file
             file_path.touch()
@@ -44,7 +49,6 @@ class TestFSWatcher(unittest.TestCase):
             time.sleep(0.2)  # Allow modified to flush
                 
             # 3. Rename file
-            new_path = self.test_dir / "test_new.txt"
             file_path.rename(new_path)
             
             # 4. Delete file
@@ -64,27 +68,34 @@ class TestFSWatcher(unittest.TestCase):
         from yyds_fswatch.watcher import _STOP_SENTINEL
         with watcher as w:
             start_time = time.time()
-            while len(events) < 4:
+            while len(events) < len(expected):
                 if time.time() - start_time > 5.0:
                     break
                 try:
                     event = w._sync_queue.get(timeout=0.2)
                     if event is _STOP_SENTINEL:
                         break
+                    event_type, source_path, destination_path = expected[len(events)]
+                    if event.event_type != event_type:
+                        continue
+                    if Path(event.src_path).resolve() != source_path:
+                        continue
+                    if destination_path is not None and (
+                        Path(event.dest_path).resolve() != destination_path
+                    ):
+                        continue
                     events.append(event)
                 except queue.Empty:
                     continue
 
         t.join()
 
-        self.assertTrue(len(events) >= 4, f"Expected at least 4 events, got {len(events)}: {events}")
-        
-        # Check event types in order
+        self.assertEqual(len(events), len(expected), f"Expected events: {expected}; got: {events}")
+
+        # Check target-file event types in order. Native backends can also
+        # report parent-directory metadata changes, which are irrelevant here.
         event_types = [e.event_type for e in events]
-        self.assertEqual(event_types[0], "created")
-        self.assertEqual(event_types[1], "modified")
-        self.assertEqual(event_types[2], "moved")
-        self.assertEqual(event_types[3], "deleted")
+        self.assertEqual(event_types, [item[0] for item in expected])
         
         # Verify moved event details
         moved_event = events[2]

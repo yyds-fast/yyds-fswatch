@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+- Canonicalize event and ignore-rule paths so macOS `/var` and `/private/var`
+  aliases remain in the same watch scope.
+- Treat a create event for an already watched file as a modification, matching
+  atomic replacement semantics on native backends.
+- Make cross-platform watcher tests ignore incidental parent-directory events
+  emitted by FSEvents.
+
 ## 0.2.1
 
 - Recover Linux root watches when a directory is removed and recreated between recovery probes.
