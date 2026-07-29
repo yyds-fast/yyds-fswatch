@@ -140,12 +140,12 @@ class PollingWatcher(BaseWatcher):
     async def _poll_loop(self):
         while self._running:
             try:
-                await asyncio.sleep(self.interval)
                 # Directory scans are blocking I/O. Keep them off the caller's
                 # asyncio loop so a slow network mount cannot stall the app.
                 new_snapshot = await self._scan_in_executor()
                 self._diff(self._snapshot, new_snapshot)
                 self._snapshot = new_snapshot
+                await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -153,6 +153,8 @@ class PollingWatcher(BaseWatcher):
                     "message": "yyds-fswatch polling scan failed",
                     "exception": exc,
                 })
+                # Avoid a tight retry loop if a scan repeatedly fails.
+                await asyncio.sleep(self.interval)
 
     def _scan(self) -> Dict[Path, Tuple[int, int, bool, int, int]]:
         snapshot = {}

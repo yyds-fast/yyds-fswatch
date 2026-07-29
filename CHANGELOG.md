@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Run the first Polling backend reconciliation immediately, avoiding missed
+  short-lived changes while a newly started Windows event loop is scheduling.
+
 ## 0.2.3
 
 - Cancel Windows synchronous directory-change reads during shutdown so native
