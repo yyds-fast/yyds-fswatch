@@ -17,7 +17,16 @@ class TestFSWatcher(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_sync_iterator_and_debounce(self):
-        watcher = FSWatcher(self.test_dir, debounce=0.1)
+        # FSEvents is allowed to coalesce rapid writes, renames, and deletes.
+        # This test verifies the synchronous iterator and debounce contract, so
+        # use the deterministic polling backend rather than asserting a native
+        # backend's best-effort event granularity.
+        watcher = FSWatcher(
+            self.test_dir,
+            debounce=0.1,
+            backend="polling",
+            poll_interval=0.02,
+        )
         file_path = self.test_dir / "test.txt"
         new_path = self.test_dir / "test_new.txt"
         expected = [
