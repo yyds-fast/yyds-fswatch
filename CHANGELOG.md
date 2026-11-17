@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.5
+
+- Prevent `GitIgnoreFilter` global patterns such as `.*` from ignoring watched root directories, add `[...]` character-class glob support, make `ignore_patterns` take precedence over `.gitignore`, and guard filter lookups/invalidations with a reentrant lock.
+- Avoid recursing into parent subdirectories for single-file and mixed file/directory watches across native and polling backends.
+- Cancel pending debounce timers when events flush early, preserve symlinks inside watched roots, re-arm backpressure overflow notifications, fix `start()`/`stop()` races, and track observed files for atomic replacements in directory mode.
+- Handle Linux `IN_MOVE_SELF` root recovery, rapid nested directory creation races, and ignored-to-visible directory renames.
+- Eliminate artificial 100ms startup/shutdown delays and spurious directory `modified` events in the Polling backend, and pre-filter ignored events in Windows and macOS native worker threads while preserving compound `FSEvents` removals and typed rename matching.
+
 ## 0.2.4
 
 - Run the first Polling backend reconciliation immediately, avoiding missed
