@@ -641,8 +641,10 @@ class FSWatcher:
         # replacement semantics by reporting it as a modification.
         if (
             event_type == "created" and
-            path in self._file_targets and
-            self._file_target_present.get(path, False)
+            (
+                (path in self._file_targets and self._file_target_present.get(path, False)) or
+                (not is_dir and path in self._observed_files)
+            )
         ):
             event_type = "modified"
 

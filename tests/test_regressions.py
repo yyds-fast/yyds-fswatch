@@ -130,6 +130,29 @@ class TestFSWatcherRegressions(unittest.TestCase):
         self.assertEqual(event.event_type, "modified")
         self.assertEqual(Path(event.src_path), target)
 
+    def test_directory_mode_observed_file_created_event_is_normalized_to_modified(self):
+        target = self.root / "target.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                watcher._on_raw_event("created", target, False)
+                first = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                # Atomic replace on FSEvents/ReadDirectoryChangesW can surface
+                # as a plain creation event on an already-observed file.
+                watcher._on_raw_event("created", target, False)
+                second = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                return first, second
+
+        first, second = asyncio.run(run())
+        self.assertEqual(first.event_type, "created")
+        self.assertEqual(second.event_type, "modified")
+        self.assertEqual(Path(second.src_path), target)
+
     def test_mixed_directory_and_file_targets_keep_directory_events(self):
         selected = self.root / "selected.txt"
         selected.write_text("old", encoding="utf-8")
@@ -642,14 +665,25 @@ class TestFSWatcherRegressions(unittest.TestCase):
         async def run():
             async with FSWatcher(
                 self.root,
-                debounce=0.01,
+                debounce=0.05,
                 use_gitignore=False,
                 ignore_patterns=["*.tmp"],
                 ignore_common_dirs=False,
             ) as watcher:
                 target.write_text("v1", encoding="utf-8")
-                created = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
-                self.assertEqual(created.event_type, "created")
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    if Path(event.src_path) == target:
+                        self.assertEqual(event.event_type, "created")
+                        break
+                else:
+                    self.fail("did not receive initial created event for target.txt")
+
+                # Let any trailing write metadata / debounce flush settle before replacing.
+                await asyncio.sleep(0.08)
+                while not watcher._queue.empty():
+                    await watcher.__anext__()
 
                 temp = self.root / ".target.tmp"
                 temp.write_text("v2", encoding="utf-8")
@@ -671,6 +705,17 @@ class TestFSWatcherRegressions(unittest.TestCase):
         outside.write_text("outside", encoding="utf-8")
         link = self.root / "link.txt"
 
+        async def next_for_link(watcher):
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while asyncio.get_running_loop().time() < deadline:
+                remaining = deadline - asyncio.get_running_loop().time()
+                event = await asyncio.wait_for(
+                    watcher.__anext__(), timeout=max(remaining, 0.05)
+                )
+                if Path(event.src_path) == link:
+                    return event
+            self.fail("did not receive expected symlink event")
+
         async def run():
             async with FSWatcher(
                 self.root,
@@ -683,9 +728,9 @@ class TestFSWatcherRegressions(unittest.TestCase):
                 except OSError as exc:
                     self.skipTest(f"symlinks unavailable: {exc}")
 
-                created = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                created = await next_for_link(watcher)
                 link.unlink()
-                deleted = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                deleted = await next_for_link(watcher)
                 return created, deleted
 
         created, deleted = asyncio.run(run())

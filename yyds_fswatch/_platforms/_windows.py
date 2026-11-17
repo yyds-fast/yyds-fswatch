@@ -361,6 +361,17 @@ class WindowsWatcher(BaseWatcher):
                         i += 1
                     elif action == 2: # REMOVED
                         is_dir = self._is_path_directory(event_path)
+                        # MoveFileExW(MOVEFILE_REPLACE_EXISTING) emits REMOVED
+                        # on the destination right before RENAMED_OLD + RENAMED_NEW.
+                        if (
+                            not is_dir and
+                            i + 2 < n and
+                            events_in_packet[i + 1][0] == 4 and
+                            events_in_packet[i + 2][0] == 5 and
+                            events_in_packet[i + 2][1] == event_path
+                        ):
+                            i += 1
+                            continue
                         self._remove_directory_from_set(event_path)
                         if not self._should_skip_event("deleted", event_path, is_dir):
                             self.on_raw_event("deleted", event_path, is_dir)
