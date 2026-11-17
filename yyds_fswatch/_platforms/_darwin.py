@@ -115,8 +115,13 @@ FSEventStreamCallback = ctypes.CFUNCTYPE(
 class DarwinWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
                  on_raw_event: Callable, ignore_filter=None):
-        super().__init__(paths, recursive, loop, on_raw_event)
-        self._ignore_filter = ignore_filter
+        super().__init__(
+            paths,
+            recursive,
+            loop,
+            on_raw_event,
+            ignore_filter=ignore_filter,
+        )
         self._stream = None
         self._run_loop = None
         self._thread = None
@@ -257,9 +262,24 @@ class DarwinWatcher(BaseWatcher):
             self._stream = None
             self._run_loop = None
 
+    def _emit_if_visible(self, event_type: str, path: Path, is_dir: bool,
+                         dest_path: Path = None):
+        if not self._should_skip_event(event_type, path, is_dir, dest_path=dest_path):
+            if dest_path is not None:
+                self.on_raw_event(event_type, path, is_dir, dest_path=dest_path)
+            else:
+                self.on_raw_event(event_type, path, is_dir)
+
     def _py_callback(self, streamRef, clientCallBackInfo, numEvents, eventPaths, eventFlags, eventIds):
         paths_ptr = ctypes.cast(eventPaths, ctypes.POINTER(ctypes.c_char_p))
         rename_candidates = []
+        modify_flags = (
+            kFSEventStreamEventFlagItemModified |
+            kFSEventStreamEventFlagItemInodeMetaMod |
+            kFSEventStreamEventFlagItemFinderInfoMod |
+            kFSEventStreamEventFlagItemChangeOwner |
+            kFSEventStreamEventFlagItemXattrMod
+        )
         
         for i in range(numEvents):
             path_str = os.fsdecode(paths_ptr[i])
@@ -275,32 +295,49 @@ class DarwinWatcher(BaseWatcher):
                 self.on_raw_event("overflow", path, False)
                 continue
             
-            # Match flags to raw events
+            # FSEvents coalesces multiple flags onto one record; avoid dropping
+            # removals when ItemCreated and ItemRemoved appear together.
             if flags & kFSEventStreamEventFlagItemRenamed:
                 # Store rename events to pair them up afterwards
                 rename_candidates.append((path, is_dir))
-            elif flags & kFSEventStreamEventFlagItemCreated:
-                self.on_raw_event("created", path, is_dir)
-            elif flags & kFSEventStreamEventFlagItemRemoved:
-                self.on_raw_event("deleted", path, is_dir)
-            elif flags & (kFSEventStreamEventFlagItemModified |
-                          kFSEventStreamEventFlagItemInodeMetaMod |
-                          kFSEventStreamEventFlagItemFinderInfoMod |
-                          kFSEventStreamEventFlagItemChangeOwner |
-                          kFSEventStreamEventFlagItemXattrMod):
-                self.on_raw_event("modified", path, is_dir)
+                continue
+
+            created = bool(flags & kFSEventStreamEventFlagItemCreated)
+            removed = bool(flags & kFSEventStreamEventFlagItemRemoved)
+            modified = bool(flags & modify_flags)
+
+            if created and removed:
+                if path.exists():
+                    self._emit_if_visible("deleted", path, is_dir)
+                    self._emit_if_visible("created", path, is_dir)
+                else:
+                    self._emit_if_visible("created", path, is_dir)
+                    self._emit_if_visible("deleted", path, is_dir)
+            elif created:
+                self._emit_if_visible("created", path, is_dir)
+            elif removed:
+                self._emit_if_visible("deleted", path, is_dir)
+            elif modified:
+                self._emit_if_visible("modified", path, is_dir)
                 
         # FSEvents has no rename cookie. Pair missing paths with existing paths
-        # in the same batch; treating every adjacent pair as a move corrupts
-        # two simultaneous inbound or outbound renames.
-        removed = [(path, is_dir) for path, is_dir in rename_candidates if not path.exists()]
-        added = [(path, is_dir) for path, is_dir in rename_candidates if path.exists()]
-        pair_count = min(len(removed), len(added))
-        for index in range(pair_count):
-            old_path, old_is_dir = removed[index]
-            new_path, _ = added[index]
-            self.on_raw_event("moved", old_path, old_is_dir, dest_path=new_path)
-        for path, is_dir in removed[pair_count:]:
-            self.on_raw_event("deleted", path, is_dir)
-        for path, is_dir in added[pair_count:]:
-            self.on_raw_event("created", path, is_dir)
+        # of matching entry kind in the same batch; positional zipping without
+        # matching is_dir corrupts simultaneous file and directory renames.
+        removed_entries = [(path, is_dir) for path, is_dir in rename_candidates if not path.exists()]
+        added_entries = [(path, is_dir) for path, is_dir in rename_candidates if path.exists()]
+        matched_added = set()
+        for old_path, old_is_dir in removed_entries:
+            matched_index = None
+            for idx, (new_path, new_is_dir) in enumerate(added_entries):
+                if idx not in matched_added and new_is_dir == old_is_dir:
+                    matched_index = idx
+                    break
+            if matched_index is not None:
+                matched_added.add(matched_index)
+                new_path, _ = added_entries[matched_index]
+                self._emit_if_visible("moved", old_path, old_is_dir, dest_path=new_path)
+            else:
+                self._emit_if_visible("deleted", old_path, old_is_dir)
+        for idx, (path, is_dir) in enumerate(added_entries):
+            if idx not in matched_added:
+                self._emit_if_visible("created", path, is_dir)

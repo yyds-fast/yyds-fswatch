@@ -60,15 +60,25 @@ class InotifyMask:
 
 class LinuxWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
-                 on_raw_event: Callable, ignore_filter=None):
-        super().__init__(paths, recursive, loop, on_raw_event)
-        self._ignore_filter = ignore_filter
+                 on_raw_event: Callable, ignore_filter=None, recursive_roots=None):
+        super().__init__(
+            paths,
+            recursive,
+            loop,
+            on_raw_event,
+            ignore_filter=ignore_filter,
+            recursive_roots=recursive_roots,
+        )
         self._fd = -1
         self._wd_to_path: Dict[int, Path] = {}
         self._path_to_wd: Dict[Path, int] = {}
+        self._file_wds = set()
+        self._watched_inodes: Dict[Path, Tuple[int, int]] = {}
         self._buffer = b''
-        self._move_cookies: Dict[int, Tuple[Path, float, bool]] = {}
+        self._move_cookies: Dict[int, Tuple[Path, float, bool, asyncio.TimerHandle]] = {}
         self._ignored_wds_pending = set()
+        self._synthesized_creates: Dict[Path, float] = {}
+        self._synthesized_prune_handle = None
         self._rebuild_scheduled = False
 
     @property
@@ -85,10 +95,18 @@ class LinuxWatcher(BaseWatcher):
         """
         if not self.is_running:
             return False
-        return all(
-            not path.exists() or path.resolve() in self._path_to_wd
-            for path in paths
-        )
+        for path in paths:
+            resolved = path.resolve()
+            try:
+                st = os.stat(resolved)
+            except OSError:
+                continue
+            if resolved not in self._path_to_wd:
+                return False
+            expected_inode = self._watched_inodes.get(resolved)
+            if expected_inode is not None and (st.st_dev, st.st_ino) != expected_inode:
+                return False
+        return True
 
     def start(self):
         if self._fd >= 0:
@@ -141,12 +159,53 @@ class LinuxWatcher(BaseWatcher):
             self._fd = -1
         self._wd_to_path.clear()
         self._path_to_wd.clear()
+        self._file_wds.clear()
+        self._watched_inodes.clear()
         self._buffer = b''
+        for _, _, _, timer in self._move_cookies.values():
+            timer.cancel()
         self._move_cookies.clear()
         self._ignored_wds_pending.clear()
+        if self._synthesized_prune_handle is not None:
+            self._synthesized_prune_handle.cancel()
+            self._synthesized_prune_handle = None
+        self._synthesized_creates.clear()
         self._rebuild_scheduled = False
 
-    def _register_path(self, path: Path):
+    def _record_root_inode(self, path: Path):
+        if path in self._watched_roots:
+            try:
+                st = os.stat(path)
+                self._watched_inodes[path] = (st.st_dev, st.st_ino)
+            except OSError:
+                pass
+
+    def _record_synthesized_create(self, path: Path):
+        now = time.monotonic()
+        self._synthesized_creates[path] = now
+        if self._synthesized_prune_handle is None and self.loop and not self.loop.is_closed():
+            self._synthesized_prune_handle = self.loop.call_later(
+                0.5, self._prune_synthesized_creates
+            )
+
+    def _consume_synthesized_create(self, path: Path) -> bool:
+        ts = self._synthesized_creates.pop(path, None)
+        if ts is None:
+            return False
+        return (time.monotonic() - ts) < 0.5
+
+    def _prune_synthesized_creates(self):
+        self._synthesized_prune_handle = None
+        now = time.monotonic()
+        expired = [p for p, ts in self._synthesized_creates.items() if now - ts >= 0.5]
+        for p in expired:
+            self._synthesized_creates.pop(p, None)
+        if self._synthesized_creates and self._fd >= 0 and self.loop and not self.loop.is_closed():
+            self._synthesized_prune_handle = self.loop.call_later(
+                0.5, self._prune_synthesized_creates
+            )
+
+    def _register_path(self, path: Path, emit_existing: bool = False):
         path = path.resolve()
         if path in self._path_to_wd:
             return
@@ -158,9 +217,11 @@ class LinuxWatcher(BaseWatcher):
                 raise OSError(err, f"inotify_add_watch failed for {path}: {os.strerror(err)}")
             self._wd_to_path[wd] = path
             self._path_to_wd[path] = wd
+            self._file_wds.add(wd)
+            self._record_root_inode(path)
             return
 
-        if not self.recursive:
+        if not self._should_recurse_into(path):
             # Single directory
             wd = inotify_add_watch(self._fd, os.fsencode(path), InotifyMask.WATCH_MASK)
             if wd < 0:
@@ -168,35 +229,51 @@ class LinuxWatcher(BaseWatcher):
                 raise OSError(err, f"inotify_add_watch failed for {path}: {os.strerror(err)}")
             self._wd_to_path[wd] = path
             self._path_to_wd[path] = wd
+            self._record_root_inode(path)
             return
 
-        # Recursive registration
-        for dirpath, dirnames, filenames in os.walk(path):
-            dir_path = Path(dirpath)
-            
-            # Prune directory tree walk using .gitignore filter
+        # Recursive registration: add inotify watch on each directory BEFORE
+        # scanning its children so no created child falls into the race gap.
+        stack = [path]
+        while stack:
+            dir_path = stack.pop()
             if self._ignore_filter and self._ignore_filter.is_ignored(dir_path, is_dir=True):
-                dirnames[:] = []  # Stop descending
                 continue
 
-            if self._ignore_filter:
-                dirnames[:] = [
-                    d for d in dirnames 
-                    if not self._ignore_filter.is_ignored(dir_path / d, is_dir=True)
-                ]
+            if dir_path not in self._path_to_wd:
+                wd = inotify_add_watch(self._fd, os.fsencode(dir_path), InotifyMask.WATCH_MASK)
+                if wd < 0:
+                    err = ctypes.get_errno()
+                    if err in (errno.ENOSPC, errno.EMFILE) and not emit_existing:
+                        raise OSError(err, f"inotify watch limit exceeded: {os.strerror(err)}")
+                    continue
+                self._wd_to_path[wd] = dir_path
+                self._path_to_wd[dir_path] = wd
+                self._record_root_inode(dir_path)
+                if emit_existing and dir_path != path:
+                    self._record_synthesized_create(dir_path)
+                    self.on_raw_event("created", dir_path, True)
 
-            if dir_path in self._path_to_wd:
+            try:
+                with os.scandir(dir_path) as entries:
+                    subdirs = []
+                    for entry in entries:
+                        try:
+                            entry_is_dir = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        entry_path = dir_path / entry.name
+                        if self._ignore_filter and self._ignore_filter.is_ignored(entry_path, is_dir=entry_is_dir):
+                            continue
+                        if entry_is_dir:
+                            subdirs.append(entry_path)
+                        elif emit_existing:
+                            self._record_synthesized_create(entry_path)
+                            self.on_raw_event("created", entry_path, False)
+                    for subdir in reversed(subdirs):
+                        stack.append(subdir)
+            except OSError:
                 continue
-
-            wd = inotify_add_watch(self._fd, os.fsencode(dir_path), InotifyMask.WATCH_MASK)
-            if wd < 0:
-                err = ctypes.get_errno()
-                if err in (errno.ENOSPC, errno.EMFILE):
-                    raise OSError(err, f"inotify watch limit exceeded: {os.strerror(err)}")
-                continue # Skip directories with permission issues or other errors
-                
-            self._wd_to_path[wd] = dir_path
-            self._path_to_wd[dir_path] = wd
 
     def _handle_raw_read(self):
         while True:
@@ -247,13 +324,14 @@ class LinuxWatcher(BaseWatcher):
         # IN_IGNORED may arrive after we deliberately removed and unmapped a
         # watch, so it must be handled before looking up the path.
         if mask & InotifyMask.IN_IGNORED:
+            self._file_wds.discard(wd)
             if wd in self._ignored_wds_pending:
                 self._ignored_wds_pending.discard(wd)
                 return
-            dir_path = self._wd_to_path.get(wd)
-            if dir_path in self._path_to_wd:
-                self._wd_to_path.pop(wd, None)
+            dir_path = self._wd_to_path.pop(wd, None)
+            if dir_path is not None and self._path_to_wd.get(dir_path) == wd:
                 self._path_to_wd.pop(dir_path, None)
+                self._watched_inodes.pop(dir_path, None)
             return
 
         dir_path = self._wd_to_path.get(wd)
@@ -263,40 +341,63 @@ class LinuxWatcher(BaseWatcher):
         event_path = dir_path / name if name else dir_path
         is_dir = bool(mask & InotifyMask.IN_ISDIR)
 
-        # Handle DELETE_SELF after resolving the watched path.
-
-        if mask & InotifyMask.IN_DELETE_SELF:
-            self.on_raw_event("deleted", dir_path, is_dir=True)
+        # Handle DELETE_SELF / MOVE_SELF / UNMOUNT after resolving the watched path.
+        if mask & InotifyMask.IN_UNMOUNT:
+            is_self_dir = wd not in self._file_wds
+            self._remove_watch_subtree(dir_path)
+            self.on_raw_event("deleted", dir_path, is_dir=is_self_dir)
             return
 
-        if mask & InotifyMask.IN_UNMOUNT:
-            self.on_raw_event("deleted", dir_path, is_dir=True)
+        if mask & InotifyMask.IN_DELETE_SELF:
+            if dir_path in self._watched_roots or dir_path.parent not in self._path_to_wd:
+                self.on_raw_event("deleted", dir_path, is_dir=(wd not in self._file_wds))
+            return
+
+        if mask & InotifyMask.IN_MOVE_SELF:
+            if dir_path in self._watched_roots and dir_path.parent not in self._path_to_wd:
+                is_self_dir = wd not in self._file_wds
+                self._remove_watch_subtree(dir_path)
+                self.on_raw_event("deleted", dir_path, is_dir=is_self_dir)
             return
 
         # Handle standard events
         if mask & InotifyMask.IN_CREATE:
-            if is_dir and self.recursive:
-                # Dynamically watch new directories
+            if self._consume_synthesized_create(event_path):
+                if is_dir and self._should_recurse_into(event_path) and event_path not in self._path_to_wd:
+                    try:
+                        self._register_path(event_path, emit_existing=True)
+                    except Exception:
+                        pass
+                return
+            self.on_raw_event("created", event_path, is_dir)
+            if is_dir and self._should_recurse_into(event_path):
+                # Dynamically watch new directories (and scan children created
+                # before inotify_add_watch attached to the new directory).
                 try:
-                    self._register_path(event_path)
+                    self._register_path(event_path, emit_existing=True)
                 except Exception:
                     pass
-            self.on_raw_event("created", event_path, is_dir)
 
         elif mask & InotifyMask.IN_DELETE:
+            self._synthesized_creates.pop(event_path, None)
             self.on_raw_event("deleted", event_path, is_dir)
 
         elif mask & (InotifyMask.IN_MODIFY | InotifyMask.IN_CLOSE_WRITE | InotifyMask.IN_ATTRIB):
             self.on_raw_event("modified", event_path, is_dir)
 
         elif mask & InotifyMask.IN_MOVED_FROM:
+            self._synthesized_creates.pop(event_path, None)
+            previous = self._move_cookies.pop(cookie, None)
+            if previous is not None:
+                previous[3].cancel()
             # Store rename cookie
-            self._move_cookies[cookie] = (event_path, time.monotonic(), is_dir)
-            self.loop.call_later(0.05, self._expire_cookie, cookie)
+            timer = self.loop.call_later(0.05, self._expire_cookie, cookie)
+            self._move_cookies[cookie] = (event_path, time.monotonic(), is_dir, timer)
 
         elif mask & InotifyMask.IN_MOVED_TO:
             if cookie in self._move_cookies:
-                old_path, _, _ = self._move_cookies.pop(cookie)
+                old_path, _, _, timer = self._move_cookies.pop(cookie)
+                timer.cancel()
                 self.on_raw_event("moved", old_path, is_dir, dest_path=event_path)
                 
                 # Update watch mappings recursively for directory renames
@@ -308,19 +409,32 @@ class LinuxWatcher(BaseWatcher):
                     if destination_ignored:
                         self._remove_watch_subtree(old_path)
                     else:
+                        was_watched = old_path in self._path_to_wd
                         self._rename_watch_subtree(old_path, event_path)
+                        if not was_watched and self._should_recurse_into(event_path):
+                            try:
+                                self._register_path(event_path, emit_existing=True)
+                            except Exception:
+                                pass
             else:
                 # Treat as created if no matching cookie
-                if is_dir and self.recursive:
+                if self._consume_synthesized_create(event_path):
+                    if is_dir and self._should_recurse_into(event_path) and event_path not in self._path_to_wd:
+                        try:
+                            self._register_path(event_path, emit_existing=True)
+                        except Exception:
+                            pass
+                    return
+                self.on_raw_event("created", event_path, is_dir)
+                if is_dir and self._should_recurse_into(event_path):
                     try:
-                        self._register_path(event_path)
+                        self._register_path(event_path, emit_existing=True)
                     except Exception:
                         pass
-                self.on_raw_event("created", event_path, is_dir)
 
     def _expire_cookie(self, cookie: int):
         if cookie in self._move_cookies:
-            old_path, _, is_dir = self._move_cookies.pop(cookie)
+            old_path, _, is_dir, _ = self._move_cookies.pop(cookie)
             # Cookie expired -> fallback to deleted event
             self.on_raw_event("deleted", old_path, is_dir)
             if is_dir:
@@ -355,6 +469,8 @@ class LinuxWatcher(BaseWatcher):
         for watched_path, wd in watches:
             self._path_to_wd.pop(watched_path, None)
             self._wd_to_path.pop(wd, None)
+            self._file_wds.discard(wd)
+            self._watched_inodes.pop(watched_path, None)
             if self._fd >= 0:
                 self._ignored_wds_pending.add(wd)
                 inotify_rm_watch(self._fd, wd)

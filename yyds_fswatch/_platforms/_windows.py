@@ -85,9 +85,15 @@ CancelSynchronousIo.restype = wintypes.BOOL
 
 class WindowsWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
-                 on_raw_event: Callable, ignore_filter=None):
-        super().__init__(paths, recursive, loop, on_raw_event)
-        self._ignore_filter = ignore_filter
+                 on_raw_event: Callable, ignore_filter=None, recursive_roots=None):
+        super().__init__(
+            paths,
+            recursive,
+            loop,
+            on_raw_event,
+            ignore_filter=ignore_filter,
+            recursive_roots=recursive_roots,
+        )
         self._handles: List[wintypes.HANDLE] = []
         self._threads: List[threading.Thread] = []
         self._running = False
@@ -103,20 +109,29 @@ class WindowsWatcher(BaseWatcher):
             thread.is_alive() for thread in self._threads
         )
 
-    def _add_directory_recursive_to_set(self, path: Path):
-        path = path.absolute()
-        with self._dir_lock:
-            self._directory_paths.add(path)
-        
-        if self.recursive:
+    def _add_directory_recursive_to_set(self, path: Path, recurse: bool = True):
+        path_abs = path.absolute()
+        found = {path_abs}
+
+        if recurse:
             try:
                 for root, dirs, files in os.walk(path):
+                    root_path = Path(root)
+                    if self._ignore_filter:
+                        if self._ignore_filter.is_ignored(root_path, is_dir=True):
+                            dirs[:] = []
+                            continue
+                        dirs[:] = [
+                            d for d in dirs
+                            if not self._ignore_filter.is_ignored(root_path / d, is_dir=True)
+                        ]
                     for d in dirs:
-                        dir_path = Path(root) / d
-                        with self._dir_lock:
-                            self._directory_paths.add(dir_path.absolute())
+                        found.add((root_path / d).absolute())
             except Exception:
                 pass
+
+        with self._dir_lock:
+            self._directory_paths.update(found)
 
     def _remove_directory_from_set(self, path: Path):
         path_abs = path.absolute()
@@ -168,8 +183,9 @@ class WindowsWatcher(BaseWatcher):
                 path = path.resolve()
                 if not path.exists():
                     continue
+                watch_recursive = self._should_recurse_into(path)
                 if path.is_dir():
-                    self._add_directory_recursive_to_set(path)
+                    self._add_directory_recursive_to_set(path, recurse=watch_recursive)
 
                 hDir = CreateFileW(
                     str(path),
@@ -189,7 +205,7 @@ class WindowsWatcher(BaseWatcher):
 
                 thread = threading.Thread(
                     target=self._watch_handle,
-                    args=(hDir, path, self._stop_event),
+                    args=(hDir, path, self._stop_event, watch_recursive),
                     name=f"yyds-fswatch:{path}",
                     daemon=True,
                 )
@@ -230,7 +246,7 @@ class WindowsWatcher(BaseWatcher):
             self._worker_thread_ids.clear()
 
     def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path,
-                      stop_event: threading.Event):
+                      stop_event: threading.Event, watch_recursive: bool):
         buf = ctypes.create_string_buffer(65536)
         bytes_returned = wintypes.DWORD(0)
         worker_thread_id = GetCurrentThreadId()
@@ -248,7 +264,7 @@ class WindowsWatcher(BaseWatcher):
                     hDir,
                     buf,
                     ctypes.sizeof(buf),
-                    self.recursive,
+                    watch_recursive,
                     NOTIFY_FILTER,
                     ctypes.byref(bytes_returned),
                     None,
@@ -313,35 +329,46 @@ class WindowsWatcher(BaseWatcher):
                     if action == 4: # RENAMED_OLD_NAME
                         if i + 1 < n and events_in_packet[i+1][0] == 5:
                             next_action, next_path = events_in_packet[i+1]
-                            is_dir = self._is_path_directory(event_path)
+                            was_tracked_dir = self._is_path_directory(event_path)
+                            is_dir = was_tracked_dir or next_path.is_dir()
                             if is_dir:
-                                self._rename_directory_in_set(event_path, next_path)
-                            self.on_raw_event("moved", event_path, is_dir, dest_path=next_path)
+                                if was_tracked_dir:
+                                    self._rename_directory_in_set(event_path, next_path)
+                                else:
+                                    self._add_directory_recursive_to_set(next_path, recurse=watch_recursive)
+                            if not self._should_skip_event("moved", event_path, is_dir, dest_path=next_path):
+                                self.on_raw_event("moved", event_path, is_dir, dest_path=next_path)
                             i += 2
                         else:
                             is_dir = self._is_path_directory(event_path)
-                            self.on_raw_event("deleted", event_path, is_dir)
+                            self._remove_directory_from_set(event_path)
+                            if not self._should_skip_event("deleted", event_path, is_dir):
+                                self.on_raw_event("deleted", event_path, is_dir)
                             i += 1
                     elif action == 5: # RENAMED_NEW_NAME
-                        is_dir = event_path.is_dir() if event_path.exists() else False
+                        is_dir = event_path.is_dir()
                         if is_dir:
-                            self._add_directory_recursive_to_set(event_path)
-                        self.on_raw_event("created", event_path, is_dir)
+                            self._add_directory_recursive_to_set(event_path, recurse=watch_recursive)
+                        if not self._should_skip_event("created", event_path, is_dir):
+                            self.on_raw_event("created", event_path, is_dir)
                         i += 1
                     elif action == 1: # ADDED
-                        is_dir = event_path.is_dir() if event_path.exists() else False
+                        is_dir = event_path.is_dir()
                         if is_dir:
-                            self._add_directory_recursive_to_set(event_path)
-                        self.on_raw_event("created", event_path, is_dir)
+                            self._add_directory_recursive_to_set(event_path, recurse=watch_recursive)
+                        if not self._should_skip_event("created", event_path, is_dir):
+                            self.on_raw_event("created", event_path, is_dir)
                         i += 1
                     elif action == 2: # REMOVED
                         is_dir = self._is_path_directory(event_path)
                         self._remove_directory_from_set(event_path)
-                        self.on_raw_event("deleted", event_path, is_dir)
+                        if not self._should_skip_event("deleted", event_path, is_dir):
+                            self.on_raw_event("deleted", event_path, is_dir)
                         i += 1
                     elif action == 3: # MODIFIED
-                        is_dir = event_path.is_dir() if event_path.exists() else False
-                        self.on_raw_event("modified", event_path, is_dir)
+                        is_dir = self._is_path_directory(event_path) or event_path.is_dir()
+                        if not self._should_skip_event("modified", event_path, is_dir):
+                            self.on_raw_event("modified", event_path, is_dir)
                         i += 1
                     else:
                         i += 1

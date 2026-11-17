@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import stat as stat_module
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,14 +12,23 @@ from ._base import BaseWatcher
 
 class PollingWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
-                 on_raw_event: Callable, ignore_filter=None, interval: float = 1.0):
-        super().__init__(paths, recursive, loop, on_raw_event)
-        self._ignore_filter = ignore_filter
+                 on_raw_event: Callable, ignore_filter=None, interval: float = 1.0,
+                 recursive_roots=None):
+        super().__init__(
+            paths,
+            recursive,
+            loop,
+            on_raw_event,
+            ignore_filter=ignore_filter,
+            recursive_roots=recursive_roots,
+        )
         self.interval = interval
         self._snapshot: Dict[Path, Tuple[int, int, bool, int, int]] = {}
         self._task: asyncio.Task = None
         self._executor = None
         self._close_done = None
+        self._close_async_event = None
+        self._close_async_loop = None
         self._close_error = None
         self._running = False
 
@@ -95,6 +105,10 @@ class PollingWatcher(BaseWatcher):
                 # than the loop's default executor: the latter must itself be
                 # synchronously joined when an asyncio loop is closed.
                 self._close_done = threading.Event()
+                running_loop = asyncio.get_running_loop()
+                done_async = asyncio.Event()
+                self._close_async_event = done_async
+                self._close_async_loop = running_loop
 
                 def join_executor():
                     try:
@@ -103,6 +117,11 @@ class PollingWatcher(BaseWatcher):
                         self._close_error = exc
                     finally:
                         self._close_done.set()
+                        if not running_loop.is_closed():
+                            try:
+                                running_loop.call_soon_threadsafe(done_async.set)
+                            except RuntimeError:
+                                pass
 
                 thread = threading.Thread(
                     target=join_executor,
@@ -112,14 +131,28 @@ class PollingWatcher(BaseWatcher):
                 thread.start()
 
         if self._close_done is not None:
-            # Use the same heartbeat as polling itself. Some embedded event
-            # loops delay selector wakeups from worker threads, so waiting on
-            # the notification without a timer can postpone cleanup.
+            # Wake up immediately via call_soon_threadsafe while preserving a
+            # bounded heartbeat for embedded loops with delayed selector wakeups.
             heartbeat = min(self.interval, 0.1)
+            current_loop = asyncio.get_running_loop()
             while not self._close_done.is_set():
-                await asyncio.sleep(heartbeat)
+                if (
+                    self._close_async_event is not None and
+                    self._close_async_loop is current_loop
+                ):
+                    try:
+                        await asyncio.wait_for(
+                            self._close_async_event.wait(),
+                            timeout=heartbeat,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(heartbeat)
             error = self._close_error
             self._close_done = None
+            self._close_async_event = None
+            self._close_async_loop = None
             self._close_error = None
             if error is not None:
                 raise RuntimeError("Polling watcher failed to shut down") from error
@@ -129,12 +162,11 @@ class PollingWatcher(BaseWatcher):
         if self._executor is None:
             raise RuntimeError("Polling watcher is not running")
         scan_future = self.loop.run_in_executor(self._executor, self._scan)
-        # Some embedded/sandboxed event loops do not wake their selector
-        # promptly after a worker performs file-system I/O. A bounded heartbeat
-        # keeps startup, cancellation, and periodic scans responsive.
+        # Wake immediately when scan_future completes while keeping a bounded
+        # heartbeat for embedded/sandboxed loops with delayed thread wakeups.
         heartbeat = min(self.interval, 0.1)
         while not scan_future.done():
-            await asyncio.sleep(heartbeat)
+            await asyncio.wait({scan_future}, timeout=heartbeat)
         return await scan_future
 
     async def _poll_loop(self):
@@ -143,6 +175,8 @@ class PollingWatcher(BaseWatcher):
                 # Directory scans are blocking I/O. Keep them off the caller's
                 # asyncio loop so a slow network mount cannot stall the app.
                 new_snapshot = await self._scan_in_executor()
+                if not self._running:
+                    break
                 self._diff(self._snapshot, new_snapshot)
                 self._snapshot = new_snapshot
                 await asyncio.sleep(self.interval)
@@ -159,50 +193,66 @@ class PollingWatcher(BaseWatcher):
     def _scan(self) -> Dict[Path, Tuple[int, int, bool, int, int]]:
         snapshot = {}
         for p in self.paths:
+            if not self._running:
+                break
             if not p.exists():
                 continue
-            self._scan_path(p, snapshot)
+            self._scan_path(
+                p,
+                snapshot,
+                is_root=True,
+                recurse=self._should_recurse_into(p.resolve()),
+            )
         return snapshot
 
-    def _scan_path(self, path: Path, snapshot: dict):
+    def _scan_path(self, path: Path, snapshot: dict, is_root: bool = False,
+                   recurse: bool = False, entry_stat=None):
+        if not self._running:
+            return
         try:
-            stat = path.stat()
-            is_dir = path.is_dir()
-            snapshot[path] = (stat.st_mtime_ns, stat.st_size, is_dir, stat.st_dev, stat.st_ino)
+            st = entry_stat if entry_stat is not None else path.stat()
+            is_dir = stat_module.S_ISDIR(st.st_mode)
+            snapshot[path] = (st.st_mtime_ns, st.st_size, is_dir, st.st_dev, st.st_ino)
         except OSError:
             return
 
-        if is_dir and (self.recursive or path in self.paths):
+        if is_dir and (recurse or is_root):
             try:
-                for entry in os.scandir(path):
-                    entry_path = Path(entry.path)
-                    entry_is_dir = entry.is_dir(follow_symlinks=False)
-                    
-                    # Apply ignore filter
-                    if self._ignore_filter and self._ignore_filter.is_ignored(entry_path, is_dir=entry_is_dir):
-                        continue
-
-                    if entry_is_dir:
-                        if self.recursive:
-                            self._scan_path(entry_path, snapshot)
-                        else:
-                            try:
-                                stat = entry.stat(follow_symlinks=False)
-                                snapshot[entry_path] = (
-                                    stat.st_mtime_ns, stat.st_size, True,
-                                    stat.st_dev, stat.st_ino,
-                                )
-                            except OSError:
-                                pass
-                    else:
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        if not self._running:
+                            return
+                        entry_path = Path(entry.path)
                         try:
-                            stat = entry.stat(follow_symlinks=False)
-                            snapshot[entry_path] = (
-                                stat.st_mtime_ns, stat.st_size, False,
-                                stat.st_dev, stat.st_ino,
-                            )
+                            entry_is_dir = entry.is_dir(follow_symlinks=False)
                         except OSError:
-                            pass
+                            continue
+
+                        # Apply ignore filter
+                        if self._ignore_filter and self._ignore_filter.is_ignored(entry_path, is_dir=entry_is_dir):
+                            continue
+
+                        try:
+                            entry_st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+
+                        if entry_is_dir and recurse:
+                            self._scan_path(
+                                entry_path,
+                                snapshot,
+                                is_root=False,
+                                recurse=True,
+                                entry_stat=entry_st,
+                            )
+                        else:
+                            snapshot[entry_path] = (
+                                entry_st.st_mtime_ns,
+                                entry_st.st_size,
+                                entry_is_dir,
+                                entry_st.st_dev,
+                                entry_st.st_ino,
+                            )
             except OSError:
                 pass
 
@@ -242,25 +292,24 @@ class PollingWatcher(BaseWatcher):
 
         # A directory move also changes every descendant path. Emit one event
         # for the top-level move, not one synthetic move per child.
-        emitted_directory_moves = []
+        emitted_dir_map: Dict[Path, Path] = {}
         for old_path, new_path, is_dir in sorted(
             move_pairs,
             key=lambda item: (len(item[0].parts), str(item[0]), str(item[1])),
         ):
             covered = False
-            for old_parent, new_parent in emitted_directory_moves:
-                try:
-                    relative = old_path.relative_to(old_parent)
-                except ValueError:
+            for old_parent in old_path.parents:
+                new_parent = emitted_dir_map.get(old_parent)
+                if new_parent is None:
                     continue
-                if new_path == new_parent / relative:
+                if new_path == new_parent / old_path.relative_to(old_parent):
                     covered = True
                     break
             if covered:
                 continue
             self.on_raw_event("moved", old_path, is_dir, dest_path=new_path)
             if is_dir:
-                emitted_directory_moves.append((old_path, new_path))
+                emitted_dir_map[old_path] = new_path
 
         for path, state in sorted(
             deleted.items(),
@@ -277,5 +326,15 @@ class PollingWatcher(BaseWatcher):
                 self.on_raw_event("created", path, state[2])
 
         for path in sorted(old.keys() & new.keys(), key=str):
-            if old[path] != new[path]:
-                self.on_raw_event("modified", path, new[path][2])
+            old_state = old[path]
+            new_state = new[path]
+            if old_state[2] != new_state[2]:
+                self.on_raw_event("deleted", path, old_state[2])
+                self.on_raw_event("created", path, new_state[2])
+            elif new_state[2]:
+                # Directory mtime/size changes whenever children are added or
+                # removed; only emit modified if its inode identity changed.
+                if old_state[4] and new_state[4] and (old_state[3], old_state[4]) != (new_state[3], new_state[4]):
+                    self.on_raw_event("modified", path, True)
+            elif old_state != new_state:
+                self.on_raw_event("modified", path, False)

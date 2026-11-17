@@ -6,12 +6,13 @@ import logging
 import queue
 import threading
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Union, List, Sequence, Callable, Dict, Optional, Set
 
 from .events import FSEvent
-from .ignore import GitIgnoreFilter
+from .ignore import GitIgnoreFilter, canonicalize_watch_path
 
 _STOP_SENTINEL = object()
 _LOGGER = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class FSWatcher:
                 self.paths.append(p_resolved)
 
         self.paths = list(dict.fromkeys(self.paths))
+        self._all_targets = frozenset(self._file_targets | self._directory_targets)
         # Kept for compatibility with code that inspected the old private flag.
         self._is_file_watch = bool(self._file_targets) and not self._directory_targets
 
@@ -96,9 +98,11 @@ class FSWatcher:
         self._recovery_task = None
         self._stop_monitor_task = None
 
-        # Debounce state
+        # Debounce & file presence state
         self._pending_events: Dict[Path, PendingState] = {}
         self._pending_timers: Dict[Path, asyncio.TimerHandle] = {}
+        self._observed_files: OrderedDict = OrderedDict()
+        self._max_observed_files = 8192
 
         # Sync iteration state
         self._sync_queue: Optional[queue.Queue] = None
@@ -107,6 +111,7 @@ class FSWatcher:
         self._bg_task: Optional[asyncio.Task] = None
         self._ready_event = threading.Event()
         self._stop_requested = threading.Event()
+        self._sync_overflow_lock = threading.Lock()
         self._startup_error = None
         self._queue_overflow_pending = False
         self._sync_overflow_pending = False
@@ -149,13 +154,16 @@ class FSWatcher:
     # --- Synchronous Loop Mode (Level 1) ---
     def start(self):
         """Start blocking monitoring loop (Ctrl+C to exit)."""
-        self._stop_requested.clear()
+        if self.is_ready or self._loop is not None:
+            raise RuntimeError("watcher is already running")
         self._ready_event.clear()
         self._startup_error = None
         try:
             asyncio.run(self._run_decorator_loop())
         except KeyboardInterrupt:
             self.stop()
+        finally:
+            self._stop_requested.clear()
 
     def stop(self):
         """Request a running watcher to stop.
@@ -198,7 +206,6 @@ class FSWatcher:
     def __enter__(self):
         if self._bg_thread is not None and self._bg_thread.is_alive():
             raise RuntimeError("watcher is already running")
-        self._stop_requested.clear()
         self._ready_event.clear()
         self._startup_error = None
         self._sync_queue = queue.Queue(maxsize=self.max_queue_size)
@@ -208,24 +215,40 @@ class FSWatcher:
         try:
             ready = self.wait_until_ready(timeout=5.0)
         except Exception:
-            self.stop()
+            self._cancel_bg_thread()
             self._bg_thread.join(timeout=2.0)
+            if not self._bg_thread.is_alive():
+                self._bg_thread = None
+            self._stop_requested.clear()
             raise
         if not ready:
-            self.stop()
+            self._cancel_bg_thread()
             self._bg_thread.join(timeout=2.0)
+            if not self._bg_thread.is_alive():
+                self._bg_thread = None
+            self._stop_requested.clear()
             raise TimeoutError("file-system watcher did not become ready within 5 seconds")
         return self
 
+    def _cancel_bg_thread(self):
+        self.stop()
+        bg_loop = self._bg_loop
+        if bg_loop is not None and bg_loop.is_running():
+            try:
+                bg_loop.call_soon_threadsafe(self._stop_bg_loop)
+            except RuntimeError:
+                pass
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._stop_requested.set()
-        if self._bg_loop and self._bg_loop.is_running():
-            self._bg_loop.call_soon_threadsafe(self._stop_bg_loop)
+        self._cancel_bg_thread()
         if self._bg_thread:
             self._bg_thread.join(timeout=2.0)
+            if not self._bg_thread.is_alive():
+                self._bg_thread = None
         # Put final sentinel just in case.
         if self._sync_queue is not None:
             self._force_sync_put(_STOP_SENTINEL)
+        self._stop_requested.clear()
 
     def _run_bg_loop(self):
         self._bg_loop = asyncio.new_event_loop()
@@ -268,7 +291,8 @@ class FSWatcher:
                 raise RuntimeError("file-system watcher stopped after an error") from self._startup_error
             raise StopIteration
         if isinstance(event, FSEvent) and event.event_type == "overflow":
-            self._sync_overflow_pending = False
+            with self._sync_overflow_lock:
+                self._sync_overflow_pending = False
         return event
 
     # --- Asynchronous Context & Iterator Mode (Level 4) ---
@@ -282,7 +306,9 @@ class FSWatcher:
         self._recovery_task = None
         self._stop_monitor_task = None
         self._queue_overflow_pending = False
-        self._sync_overflow_pending = False
+        with self._sync_overflow_lock:
+            self._sync_overflow_pending = False
+        self._observed_files.clear()
         self._file_target_present = {p: p.exists() for p in self._file_targets}
 
         try:
@@ -321,6 +347,7 @@ class FSWatcher:
             if self._ignore_filter is not None:
                 self._ignore_filter.close()
                 self._ignore_filter = None
+            self._loop = None
             self._stop_requested.clear()
             raise
 
@@ -328,9 +355,10 @@ class FSWatcher:
         return frozenset(p for p in self.paths if p.exists())
 
     def _create_platform_watcher(self, watcher_cls):
+        effective_recursive = self.recursive and bool(self._directory_targets)
         kwargs = dict(
             paths=self.paths,
-            recursive=self.recursive,
+            recursive=effective_recursive,
             loop=self._loop,
             on_raw_event=self._on_raw_event,
             ignore_filter=self._ignore_filter,
@@ -338,6 +366,12 @@ class FSWatcher:
         from ._platforms._polling import PollingWatcher
         if watcher_cls is PollingWatcher:
             kwargs["interval"] = self.poll_interval
+        if effective_recursive and self._file_targets:
+            try:
+                if "recursive_roots" in inspect.signature(watcher_cls.__init__).parameters:
+                    kwargs["recursive_roots"] = self._directory_targets
+            except (TypeError, ValueError):
+                pass
         watcher = watcher_cls(**kwargs)
         self._backend_name = watcher_cls.__name__
         return watcher
@@ -389,15 +423,17 @@ class FSWatcher:
             timer.cancel()
         self._pending_timers.clear()
         self._pending_events.clear()
+        self._observed_files.clear()
 
         if self._watcher:
             try:
                 await self._stop_platform_watcher()
             except Exception as exc:
-                self._loop.call_exception_handler({
-                    "message": "yyds-fswatch backend cleanup failed",
-                    "exception": exc,
-                })
+                if self._loop is not None:
+                    self._loop.call_exception_handler({
+                        "message": "yyds-fswatch backend cleanup failed",
+                        "exception": exc,
+                    })
             self._watcher = None
             # Let cancelled backend tasks observe cancellation before a
             # short-lived background event loop is closed.
@@ -409,6 +445,7 @@ class FSWatcher:
 
         if self._queue is not None:
             self._force_async_put(_STOP_SENTINEL)
+        self._loop = None
         self._stop_requested.clear()
 
     async def _stop_monitor_loop(self):
@@ -432,19 +469,21 @@ class FSWatcher:
                 backend_healthy = bool(
                     self._watcher and self._watcher.is_healthy_for(current_paths)
                 )
+                restarted_for_health = False
                 if current_paths and watcher_running and not backend_healthy:
                     try:
                         await self._stop_platform_watcher()
                     except Exception:
                         pass
                     watcher_running = False
+                    restarted_for_health = True
 
                 if current_paths != existing_paths and watcher_running:
                     if self._watcher:
                         await self._stop_platform_watcher()
                     watcher_running = False
 
-                if current_paths != existing_paths and self._ignore_filter:
+                if (current_paths != existing_paths or restarted_for_health) and self._ignore_filter:
                     self._ignore_filter.refresh()
 
                 if current_paths and not watcher_running:
@@ -498,6 +537,44 @@ class FSWatcher:
             pass
         self._loop.call_soon_threadsafe(self._push_to_debounce, event_type, path, is_dir, dest_path)
 
+    def _canonicalize_path(self, path: Path) -> Path:
+        return canonicalize_watch_path(path, self._all_targets)
+
+    def _remember_observed_file(self, path: Path):
+        if path in self._observed_files:
+            self._observed_files.move_to_end(path)
+        else:
+            self._observed_files[path] = True
+            if len(self._observed_files) > self._max_observed_files:
+                self._observed_files.popitem(last=False)
+
+    def _forget_observed_path(self, path: Path, is_dir: bool):
+        self._observed_files.pop(path, None)
+        if is_dir and self._observed_files:
+            to_remove = []
+            for observed in self._observed_files:
+                try:
+                    observed.relative_to(path)
+                    to_remove.append(observed)
+                except ValueError:
+                    continue
+            for observed in to_remove:
+                self._observed_files.pop(observed, None)
+
+    def _remap_observed_subtree(self, old_dir: Path, new_dir: Path):
+        if not self._observed_files:
+            return
+        remapped = []
+        for observed in list(self._observed_files):
+            try:
+                relative = observed.relative_to(old_dir)
+            except ValueError:
+                continue
+            self._observed_files.pop(observed, None)
+            remapped.append(new_dir / relative)
+        for new_path in remapped:
+            self._remember_observed_file(new_path)
+
     def _push_to_debounce(self, event_type: str, path: Path, is_dir: bool, dest_path: Path = None):
         if not self.is_ready or self._stop_requested.is_set():
             return
@@ -507,6 +584,7 @@ class FSWatcher:
             # watches so subsequent visibility checks reload current rules.
             if self._ignore_filter:
                 self._ignore_filter.refresh()
+            self._observed_files.clear()
             # Flush all pending events first to preserve order
             for p in list(self._pending_events.keys()):
                 self._flush_event(p)
@@ -520,17 +598,19 @@ class FSWatcher:
             self._emit_event(event)
             return
 
-        # Watch targets are canonicalized at construction.  Do the same for
-        # backend paths so macOS aliases such as /var and /private/var do not
-        # make an otherwise in-scope event look unrelated to its target.
-        path = Path(path).resolve()
-        dest_path = Path(dest_path).resolve() if dest_path else None
+        # Watch targets are canonicalized at construction. Canonicalize parent
+        # directories so macOS aliases such as /var and /private/var remain
+        # in-scope without resolving symlinks inside watched roots away.
+        path = self._canonicalize_path(path)
+        dest_path = self._canonicalize_path(dest_path) if dest_path else None
 
         if self._ignore_filter:
             self._ignore_filter.notify_event(event_type, path, is_dir, dest_path)
 
-        source_visible = self._is_visible_path(path, is_dir)
-        dest_visible = bool(dest_path and self._is_visible_path(dest_path, is_dir))
+        source_visible = self._is_visible_path(path, is_dir, canonicalized=True)
+        dest_visible = bool(
+            dest_path and self._is_visible_path(dest_path, is_dir, canonicalized=True)
+        )
 
         # Convert moves across the visible boundary into a deletion or creation.
         if event_type == "moved":
@@ -540,7 +620,14 @@ class FSWatcher:
                 event_type = "deleted"
                 dest_path = None
             elif dest_visible:
-                was_present = self._file_target_present.get(dest_path, False)
+                if dest_path in self._file_targets:
+                    was_present = self._file_target_present.get(dest_path, False)
+                else:
+                    pending_state = self._pending_events.get(dest_path)
+                    was_present = (
+                        dest_path in self._observed_files or
+                        (pending_state is not None and pending_state.event_type != "deleted")
+                    )
                 event_type = "modified" if was_present else "created"
                 path = dest_path
                 dest_path = None
@@ -560,6 +647,18 @@ class FSWatcher:
             event_type = "modified"
 
         self._update_file_target_state(event_type, path, dest_path)
+        if event_type in {"created", "modified"}:
+            if not is_dir:
+                self._remember_observed_file(path)
+        elif event_type == "deleted":
+            self._forget_observed_path(path, is_dir)
+        elif event_type == "moved":
+            if is_dir and dest_path is not None:
+                self._remap_observed_subtree(path, dest_path)
+            else:
+                self._forget_observed_path(path, is_dir)
+                if not is_dir and dest_path is not None:
+                    self._remember_observed_file(dest_path)
 
         # 2. moved events bypass debounce to prevent rename cookie loss/delay
         if event_type == "moved":
@@ -607,15 +706,16 @@ class FSWatcher:
         else:
             self._flush_event(path)
 
-    def _is_visible_path(self, path: Path, is_dir: bool) -> bool:
-        if not self._is_path_in_scope(path):
+    def _is_visible_path(self, path: Path, is_dir: bool, canonicalized: bool = False) -> bool:
+        if not self._is_path_in_scope(path, canonicalized=canonicalized):
             return False
         if self._ignore_filter and self._ignore_filter.is_ignored(path, is_dir):
             return False
         return True
 
-    def _is_path_in_scope(self, path: Path) -> bool:
-        path = Path(path).resolve()
+    def _is_path_in_scope(self, path: Path, canonicalized: bool = False) -> bool:
+        if not canonicalized:
+            path = self._canonicalize_path(path)
         if path in self._file_targets:
             return True
         for root in self._directory_targets:
@@ -640,7 +740,9 @@ class FSWatcher:
 
     def _flush_event(self, path: Path):
         state = self._pending_events.pop(path, None)
-        self._pending_timers.pop(path, None)
+        timer = self._pending_timers.pop(path, None)
+        if timer is not None:
+            timer.cancel()
         if state:
             event = FSEvent(
                 event_type=state.event_type,
@@ -654,6 +756,8 @@ class FSWatcher:
             return
         try:
             self._queue.put_nowait(event)
+            if event.event_type != "overflow":
+                self._queue_overflow_pending = False
         except asyncio.QueueFull:
             self._dropped_event_count += 1
             if self._queue_overflow_pending:
@@ -684,18 +788,21 @@ class FSWatcher:
     def _put_sync_event(self, event):
         if self._sync_queue is None or self._stop_requested.is_set():
             return
-        try:
-            self._sync_queue.put_nowait(event)
-        except queue.Full:
-            self._dropped_event_count += 1
-            if self._sync_overflow_pending:
-                return
-            self._sync_overflow_pending = True
+        with self._sync_overflow_lock:
             try:
-                self._sync_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self._force_sync_put(self._make_backpressure_overflow_event())
+                self._sync_queue.put_nowait(event)
+                if isinstance(event, FSEvent) and event.event_type != "overflow":
+                    self._sync_overflow_pending = False
+            except queue.Full:
+                self._dropped_event_count += 1
+                if self._sync_overflow_pending:
+                    return
+                self._sync_overflow_pending = True
+                try:
+                    self._sync_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self._force_sync_put(self._make_backpressure_overflow_event())
 
     def _force_sync_put(self, item):
         if self._sync_queue is None:

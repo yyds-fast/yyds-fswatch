@@ -527,6 +527,397 @@ class TestFSWatcherRegressions(unittest.TestCase):
             self.assertIn(("deleted", old_path), event_types_and_paths)
             self.assertIn(("created", new_path), event_types_and_paths)
 
+    def test_single_file_watch_does_not_recurse_parent_subdirectories(self):
+        target = self.root / "target.txt"
+        target.write_text("x", encoding="utf-8")
+        subdir = self.root / "nested"
+        subdir.mkdir()
+        (subdir / "deep.txt").write_text("y", encoding="utf-8")
+
+        async def run():
+            async with FSWatcher(
+                target,
+                recursive=True,
+                backend="polling",
+                poll_interval=0.05,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as poll_watcher:
+                self.assertFalse(poll_watcher._watcher.recursive)
+                self.assertNotIn(subdir / "deep.txt", poll_watcher._watcher._snapshot)
+
+            if sys.platform.startswith("linux"):
+                async with FSWatcher(
+                    target,
+                    recursive=True,
+                    backend="native",
+                    use_gitignore=False,
+                    ignore_common_dirs=False,
+                ) as native_watcher:
+                    self.assertFalse(native_watcher._watcher.recursive)
+                    self.assertIn(self.root, native_watcher._watcher._path_to_wd)
+                    self.assertNotIn(subdir, native_watcher._watcher._path_to_wd)
+
+            # Mixed directory + file targets must only recurse the directory target.
+            other_dir = self.base_dir / "other_dir"
+            other_dir.mkdir()
+            other_sub = other_dir / "sub"
+            other_sub.mkdir()
+            other_file = other_dir / "picked.txt"
+            other_file.write_text("z", encoding="utf-8")
+
+            async with FSWatcher(
+                [self.root, other_file],
+                recursive=True,
+                backend="polling",
+                poll_interval=0.05,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as mixed_watcher:
+                self.assertIn(subdir / "deep.txt", mixed_watcher._watcher._snapshot)
+                self.assertIn(other_file, mixed_watcher._watcher._snapshot)
+                self.assertIn(other_sub, mixed_watcher._watcher._snapshot)
+                self.assertNotIn(other_sub / "never", mixed_watcher._watcher._snapshot)
+
+        asyncio.run(run())
+
+    def test_dot_star_ignore_pattern_keeps_root_watched(self):
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0,
+                recovery_interval=0.05,
+                ignore_patterns=[".*"],
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                if sys.platform.startswith("linux"):
+                    self.assertIn(self.root, watcher._watcher._path_to_wd)
+                (self.root / ".hidden").write_text("secret", encoding="utf-8")
+                visible = self.root / "visible.txt"
+                visible.write_text("ok", encoding="utf-8")
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    if Path(event.src_path).name == "visible.txt":
+                        return event, watcher.is_running
+                self.fail("did not receive event for visible.txt with ignore_patterns=['.*']")
+
+        event, is_running = asyncio.run(run())
+        self.assertEqual(event.event_type, "created")
+        self.assertTrue(is_running)
+
+    def test_flush_event_cancels_pending_debounce_timer(self):
+        target = self.root / "debounced.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.12,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                watcher._push_to_debounce("modified", target, False)
+                # Force early flush before debounce expires.
+                watcher._push_to_debounce("overflow", self.root, False)
+                ev1 = await asyncio.wait_for(watcher.__anext__(), timeout=0.1)
+                ev2 = await asyncio.wait_for(watcher.__anext__(), timeout=0.1)
+                self.assertEqual((ev1.event_type, ev2.event_type), ("modified", "overflow"))
+
+                # Push a new event right away. If the old timer wasn't cancelled,
+                # it would fire prematurely before the new 0.12s window completes.
+                watcher._push_to_debounce("modified", target, False)
+                await asyncio.sleep(0.06)
+                self.assertTrue(watcher._queue.empty())
+
+                ev3 = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                self.assertEqual(ev3.event_type, "modified")
+                self.assertEqual(Path(ev3.src_path), target)
+
+        asyncio.run(run())
+
+    def test_directory_mode_atomic_replace_after_observed_reports_modified(self):
+        target = self.root / "target.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.01,
+                use_gitignore=False,
+                ignore_patterns=["*.tmp"],
+                ignore_common_dirs=False,
+            ) as watcher:
+                target.write_text("v1", encoding="utf-8")
+                created = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                self.assertEqual(created.event_type, "created")
+
+                temp = self.root / ".target.tmp"
+                temp.write_text("v2", encoding="utf-8")
+                os.replace(temp, target)
+
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    if Path(event.src_path) == target:
+                        return event
+                self.fail("did not receive replacement event for target.txt")
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "modified")
+        self.assertEqual(Path(event.src_path), target)
+
+    def test_symlink_inside_root_reports_link_creation_and_deletion(self):
+        outside = self.base_dir / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        link = self.root / "link.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.01,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                try:
+                    os.symlink(outside, link)
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+
+                created = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                link.unlink()
+                deleted = await asyncio.wait_for(watcher.__anext__(), timeout=1.0)
+                return created, deleted
+
+        created, deleted = asyncio.run(run())
+        self.assertEqual(created.event_type, "created")
+        self.assertEqual(Path(created.src_path), link)
+        self.assertEqual(deleted.event_type, "deleted")
+        self.assertEqual(Path(deleted.src_path), link)
+
+    def test_backpressure_overflow_rearms_after_subsequent_event_queued(self):
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0,
+                max_queue_size=2,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                watcher._push_to_debounce("created", self.root / "one", False)
+                watcher._push_to_debounce("created", self.root / "two", False)
+                # Triggers first overflow: queue becomes [two, overflow_1].
+                watcher._push_to_debounce("created", self.root / "three", False)
+
+                first = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
+                self.assertEqual(Path(first.src_path).name, "two")
+
+                # Queue now has 1 free slot; queueing "four" should re-arm overflow.
+                watcher._push_to_debounce("created", self.root / "four", False)
+                # Queue is full again [overflow_1, four]; "five" triggers overflow_2.
+                watcher._push_to_debounce("created", self.root / "five", False)
+
+                ev_a = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
+                ev_b = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
+                return ev_a, ev_b
+
+        ev_a, ev_b = asyncio.run(run())
+        self.assertEqual(Path(ev_a.src_path).name, "four")
+        self.assertEqual(ev_b.event_type, "overflow")
+
+    def test_polling_diff_ignores_directory_mtime_changes_on_child_edits(self):
+        sub = self.root / "sub"
+        child = sub / "child.txt"
+        events = []
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        watcher = PollingWatcher(
+            [self.root], True, loop,
+            lambda event_type, path, is_dir, **kwargs: events.append((event_type, path, is_dir)),
+        )
+        old = {
+            self.root: (100, 4096, True, 1, 1),
+            sub: (100, 4096, True, 1, 2),
+        }
+        new = {
+            self.root: (200, 4096, True, 1, 1),
+            sub: (200, 8192, True, 1, 2),
+            child: (200, 10, False, 1, 3),
+        }
+        watcher._diff(old, new)
+        self.assertEqual(events, [("created", child, False)])
+
+    def test_polling_startup_and_close_avoid_artificial_heartbeat_delay(self):
+        async def run():
+            started = time.monotonic()
+            async with FSWatcher(
+                self.root,
+                backend="polling",
+                poll_interval=0.5,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ):
+                pass
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(run())
+        self.assertLess(elapsed, 0.15)
+
+    def test_stop_immediately_after_thread_start_does_not_hang(self):
+        watcher = FSWatcher(self.root, use_gitignore=False, ignore_common_dirs=False)
+        thread = threading.Thread(target=watcher.start)
+        thread.start()
+        watcher.stop()
+        thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify-specific regression")
+    def test_linux_root_move_self_and_recreate_recovers(self):
+        moved_root = self.base_dir / "moved_root"
+        stale_file = moved_root / "stale.txt"
+        new_file = self.root / "recovered.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.01,
+                recovery_interval=0.03,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                os.rename(self.root, moved_root)
+                self.root.mkdir()
+                await asyncio.sleep(0.1)
+                stale_file.write_text("stale", encoding="utf-8")
+                new_file.write_text("fresh", encoding="utf-8")
+
+                events = []
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    try:
+                        event = await asyncio.wait_for(watcher.__anext__(), timeout=0.15)
+                    except asyncio.TimeoutError:
+                        continue
+                    events.append(event)
+                    if Path(event.src_path) == new_file and event.event_type == "created":
+                        return events
+                self.fail(f"recreated root after move did not resume; got: {events}")
+
+        events = asyncio.run(run())
+        self.assertFalse(any("stale.txt" in e.src_path for e in events))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify-specific regression")
+    def test_linux_rapid_nested_dir_creation_captures_children(self):
+        nested_dir = self.root / "a" / "b" / "c"
+        nested_file = nested_dir / "deep.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.01,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                os.makedirs(nested_dir)
+                nested_file.write_text("hello", encoding="utf-8")
+
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    if Path(event.src_path) == nested_file:
+                        return event
+                self.fail("nested file created inside rapid makedirs was missed")
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "created")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify-specific regression")
+    def test_linux_ignored_dir_renamed_to_visible_is_watched(self):
+        hidden_dir = self.root / ".staging"
+        hidden_dir.mkdir()
+        (hidden_dir / "before.txt").write_text("1", encoding="utf-8")
+        visible_dir = self.root / "visible"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.01,
+                ignore_patterns=[".*"],
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                os.rename(hidden_dir, visible_dir)
+                await asyncio.sleep(0.05)
+                (visible_dir / "after.txt").write_text("2", encoding="utf-8")
+
+                seen = set()
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    seen.add((event.event_type, Path(event.src_path)))
+                    if ("created", visible_dir / "after.txt") in seen:
+                        return seen
+                self.fail(f"renamed visible directory was not watched; seen: {seen}")
+
+        seen = asyncio.run(run())
+        self.assertIn(("created", visible_dir / "after.txt"), seen)
+        self.assertIn(("created", visible_dir / "before.txt"), seen)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS-specific regression")
+    def test_darwin_compound_flags_and_typed_renames(self):
+        import ctypes
+        from yyds_fswatch._platforms._darwin import (
+            DarwinWatcher,
+            kFSEventStreamEventFlagItemCreated,
+            kFSEventStreamEventFlagItemIsDir,
+            kFSEventStreamEventFlagItemRemoved,
+            kFSEventStreamEventFlagItemRenamed,
+        )
+
+        events = []
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        watcher = DarwinWatcher(
+            [self.root], True, loop,
+            lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+        gone_file = self.root / "gone.txt"
+        old_file = self.root / "old.txt"
+        new_file = self.root / "new.txt"
+        old_dir = self.root / "old_dir"
+        new_dir = self.root / "new_dir"
+        new_file.write_text("x", encoding="utf-8")
+        new_dir.mkdir()
+
+        raw_paths = [
+            os.fsencode(gone_file),
+            os.fsencode(old_file),
+            os.fsencode(new_dir),
+            os.fsencode(old_dir),
+            os.fsencode(new_file),
+        ]
+        paths_arr = (ctypes.c_char_p * len(raw_paths))(*raw_paths)
+        flags_arr = (ctypes.c_uint32 * len(raw_paths))(
+            kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved,
+            kFSEventStreamEventFlagItemRenamed,
+            kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsDir,
+            kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsDir,
+            kFSEventStreamEventFlagItemRenamed,
+        )
+        ids_arr = (ctypes.c_uint64 * len(raw_paths))(1, 2, 3, 4, 5)
+        watcher._py_callback(
+            None,
+            None,
+            len(raw_paths),
+            ctypes.cast(paths_arr, ctypes.c_void_p),
+            flags_arr,
+            ids_arr,
+        )
+
+        self.assertIn((("created", gone_file, False), {}), events)
+        self.assertIn((("deleted", gone_file, False), {}), events)
+        self.assertIn((("moved", old_file, False), {"dest_path": new_file}), events)
+        self.assertIn((("moved", old_dir, True), {"dest_path": new_dir}), events)
+
 
 if __name__ == "__main__":
     unittest.main()

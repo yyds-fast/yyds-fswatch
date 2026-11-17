@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import os
+import threading
 import unittest
 import tempfile
 from pathlib import Path
@@ -123,6 +125,120 @@ class TestGitIgnoreFilter(unittest.TestCase):
 
         self.assertTrue(enabled.is_ignored(artifact))
         self.assertFalse(disabled.is_ignored(artifact))
+
+    def test_root_directory_not_ignored_by_dot_star_pattern(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            filt = GitIgnoreFilter(
+                root_paths=[root],
+                use_gitignore=False,
+                ignore_patterns=[".*", "*"],
+                ignore_common_dirs=False,
+            )
+            try:
+                self.assertFalse(filt.is_ignored(root, is_dir=True))
+                self.assertTrue(filt.is_ignored(root / ".hidden", is_dir=False))
+                self.assertTrue(filt.is_ignored(root / "normal.txt", is_dir=False))
+            finally:
+                filt.close()
+
+    def test_character_class_glob_patterns(self):
+        filt = GitIgnoreFilter(
+            root_paths=[self.temp_dir],
+            use_gitignore=False,
+            ignore_patterns=["*.py[cod]", "[!a-z]*.txt"],
+            ignore_common_dirs=False,
+        )
+        try:
+            self.assertTrue(filt.is_ignored(self.temp_dir / "mod.pyc"))
+            self.assertTrue(filt.is_ignored(self.temp_dir / "pkg" / "mod.pyo"))
+            self.assertTrue(filt.is_ignored(self.temp_dir / "mod.pyd"))
+            self.assertFalse(filt.is_ignored(self.temp_dir / "mod.py"))
+            self.assertTrue(filt.is_ignored(self.temp_dir / "1note.txt"))
+            self.assertFalse(filt.is_ignored(self.temp_dir / "anote.txt"))
+        finally:
+            filt.close()
+
+    def test_explicit_ignore_patterns_override_gitignore(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            (root / ".gitignore").write_text("*.log\n", encoding="utf-8")
+            filt = GitIgnoreFilter(
+                root_paths=[root],
+                use_gitignore=True,
+                ignore_patterns=["!important.log"],
+                ignore_common_dirs=False,
+            )
+            try:
+                self.assertTrue(filt.is_ignored(root / "other.log"))
+                self.assertFalse(filt.is_ignored(root / "important.log"))
+            finally:
+                filt.close()
+
+    def test_symlink_inside_root_keeps_root_scope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir).resolve()
+            root = base / "root"
+            outside = base / "outside.txt"
+            root.mkdir()
+            outside.write_text("x", encoding="utf-8")
+            link = root / "link.txt"
+            ignored_link = root / "ignored.log"
+            try:
+                os.symlink(outside, link)
+                os.symlink(outside, ignored_link)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            filt = GitIgnoreFilter(
+                root_paths=[root],
+                use_gitignore=False,
+                ignore_patterns=["*.log"],
+                ignore_common_dirs=False,
+            )
+            try:
+                self.assertFalse(filt.is_ignored(link, is_dir=False))
+                self.assertTrue(filt.is_ignored(ignored_link, is_dir=False))
+            finally:
+                filt.close()
+
+    def test_concurrent_lookup_and_invalidation_is_thread_safe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            gitignore = root / ".gitignore"
+            gitignore.write_text("*.log\n", encoding="utf-8")
+            filt = GitIgnoreFilter(
+                root_paths=[root],
+                use_gitignore=True,
+                ignore_common_dirs=False,
+            )
+            errors = []
+            stop = threading.Event()
+
+            def reader():
+                try:
+                    i = 0
+                    while not stop.is_set():
+                        filt.is_ignored(root / f"file_{i % 32}.log")
+                        filt.is_ignored(root / f"file_{i % 32}.txt")
+                        i += 1
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=reader)
+            thread.start()
+            try:
+                for i in range(100):
+                    gitignore.write_text("*.tmp\n" if i % 2 else "*.log\n", encoding="utf-8")
+                    filt.notify_event("modified", gitignore, False)
+                    if i % 10 == 0:
+                        filt.refresh()
+            finally:
+                stop.set()
+                thread.join(timeout=2.0)
+                filt.close()
+
+            self.assertEqual(errors, [])
 
 if __name__ == "__main__":
     unittest.main()
