@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6
+
+- Normalize plain `created` atomic-replacement events for already-observed files in directory-watch mode to `modified` (fixing macOS `FSEvents` directory atomic saves).
+- Collapse intermediate Windows `FILE_ACTION_REMOVED` records when immediately followed by `RENAMED_OLD_NAME` + `RENAMED_NEW_NAME` on the same target file within one packet.
+- Pin CI Python 3.9 to `ubuntu-24.04` and filter incidental root events in cross-platform symlink tests.
+
 ## 0.2.5
 
 - Prevent `GitIgnoreFilter` global patterns such as `.*` from ignoring watched root directories, add `[...]` character-class glob support, make `ignore_patterns` take precedence over `.gitignore`, and guard filter lookups/invalidations with a reentrant lock.
