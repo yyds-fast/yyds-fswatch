@@ -127,6 +127,10 @@ CancelIo = kernel32.CancelIo
 CancelIo.argtypes = [wintypes.HANDLE]
 CancelIo.restype = wintypes.BOOL
 
+CancelIoEx = kernel32.CancelIoEx
+CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+CancelIoEx.restype = wintypes.BOOL
+
 class WindowsWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
                  on_raw_event: Callable, ignore_filter=None, recursive_roots=None):
@@ -365,6 +369,9 @@ class WindowsWatcher(BaseWatcher):
         self._stop_event.set()
         if self._stop_win_event:
             SetEvent(self._stop_win_event)
+        for h in self._handles:
+            if h not in (INVALID_HANDLE_VALUE, None):
+                CancelIoEx(h, None)
 
         for t in self._threads:
             t.join(timeout=1.0)
@@ -409,6 +416,7 @@ class WindowsWatcher(BaseWatcher):
         overlapped = OVERLAPPED()
         wait_handles = (wintypes.HANDLE * 2)(io_event, stop_win_event)
         io_pending = False
+        recent_ignored_adds: Dict[Path, Path] = {}
 
         try:
             while not stop_event.is_set():
@@ -453,21 +461,22 @@ class WindowsWatcher(BaseWatcher):
                     # Kernel directory-change buffer is now armed on hDir.
                     worker_ready.set()
 
-                if not issued:
-                    wait_rc = WaitForMultipleObjects(2, wait_handles, False, INFINITE)
-                    if wait_rc == WAIT_OBJECT_0 + 1 or stop_event.is_set():
-                        break
-                    if wait_rc != WAIT_OBJECT_0:
-                        werr = ctypes.get_last_error()
-                        if not stop_event.is_set():
-                            self._report_backend_error(watch_path, werr)
-                        break
+                # ReadDirectoryChangesW returns TRUE even when NtNotifyChangeDirectoryFile
+                # returns STATUS_PENDING, so always wait on [io_event, stop_win_event].
+                wait_rc = WaitForMultipleObjects(2, wait_handles, False, INFINITE)
+                if wait_rc == WAIT_OBJECT_0 + 1 or stop_event.is_set():
+                    break
+                if wait_rc != WAIT_OBJECT_0:
+                    werr = ctypes.get_last_error()
+                    if not stop_event.is_set():
+                        self._report_backend_error(watch_path, werr)
+                    break
 
                 ok = GetOverlappedResult(
                     hDir,
                     ctypes.byref(overlapped),
                     ctypes.byref(bytes_returned),
-                    True,
+                    False,
                 )
                 io_pending = False
                 if not ok:
@@ -513,6 +522,11 @@ class WindowsWatcher(BaseWatcher):
                     action, event_path = events_in_packet[i]
 
                     if action == 4: # RENAMED_OLD_NAME
+                        if "~" in event_path.name and not event_path.exists():
+                            cand = recent_ignored_adds.get(event_path.parent)
+                            if cand is not None and not cand.exists():
+                                recent_ignored_adds.pop(event_path.parent, None)
+                                event_path = cand
                         if i + 1 < n and events_in_packet[i+1][0] == 5:
                             next_action, next_path = events_in_packet[i+1]
                             was_tracked_dir = self._is_path_directory(event_path)
@@ -544,8 +558,14 @@ class WindowsWatcher(BaseWatcher):
                             self._add_directory_recursive_to_set(event_path, recurse=watch_recursive)
                         if not self._should_skip_event("created", event_path, is_dir):
                             self.on_raw_event("created", event_path, is_dir)
+                        elif not is_dir:
+                            if len(recent_ignored_adds) >= 64:
+                                recent_ignored_adds.clear()
+                            recent_ignored_adds[event_path.parent] = event_path
                         i += 1
                     elif action == 2: # REMOVED
+                        if recent_ignored_adds.get(event_path.parent) == event_path:
+                            recent_ignored_adds.pop(event_path.parent, None)
                         is_dir = self._is_path_directory(event_path)
                         # MoveFileExW(MOVEFILE_REPLACE_EXISTING) emits REMOVED
                         # on the destination right before RENAMED_OLD + RENAMED_NEW.

@@ -71,6 +71,7 @@ class GitIgnoreFilter:
 
         self._use_gitignore = use_gitignore
         self._ignore_common_dirs = ignore_common_dirs
+        self._case_insensitive = os.path.normcase("A") != "A"
         self._fast_ignore_dirs = {
             ".git", "node_modules", "__pycache__", ".venv", "venv",
             ".egg-info", "dist", "build",
@@ -326,8 +327,9 @@ class GitIgnoreFilter:
         else:
             regex_text = "(^|.*?/)" + regex_body + "$"
 
+        flags = re.IGNORECASE if self._case_insensitive else 0
         try:
-            rule_list.append((re.compile(regex_text), is_dir_only, is_negated))
+            rule_list.append((re.compile(regex_text, flags), is_dir_only, is_negated))
         except re.error:
             return
 
@@ -366,6 +368,8 @@ class GitIgnoreFilter:
 
             if self._ignore_common_dirs:
                 last_part = rel_path.parts[-1]
+                if self._case_insensitive:
+                    last_part = last_part.lower()
                 if is_dir and (last_part in self._fast_ignore_dirs or last_part.endswith(".egg-info")):
                     return True
 

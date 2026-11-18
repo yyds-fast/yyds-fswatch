@@ -321,5 +321,24 @@ class TestGitIgnoreFilter(unittest.TestCase):
         finally:
             filt.close()
 
+    def test_case_insensitive_filesystem_matches_uppercase_8dot3_short_names(self):
+        original_normcase = os.path.normcase
+        os.path.normcase = lambda s: str(s).lower()
+        filt = None
+        try:
+            filt = GitIgnoreFilter(
+                root_paths=[self.temp_dir],
+                use_gitignore=False,
+                ignore_patterns=["*.tmp"],
+                ignore_common_dirs=True,
+            )
+            self.assertTrue(filt.is_ignored(self.temp_dir / "TARGET~1.TMP", False))
+            self.assertTrue(filt.is_ignored(self.temp_dir / "DIST" / "pkg.whl", False))
+            self.assertFalse(filt.is_ignored(self.temp_dir / "target.txt", False))
+        finally:
+            os.path.normcase = original_normcase
+            if filt is not None:
+                filt.close()
+
 if __name__ == "__main__":
     unittest.main()

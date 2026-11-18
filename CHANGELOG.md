@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.9
+
+- Match gitignore patterns case-insensitively on case-insensitive filesystems (Windows NTFS) and correlate NTFS 8.3 short-name `FILE_ACTION_RENAMED_OLD_NAME` records (`TARGET~1.TMP` / `STAGIN~1`) back to ignored staging files so directory-mode atomic replacements reliably emit `modified` on the target path.
+- Always wait on `[io_event, stop_win_event]` via `WaitForMultipleObjects` and issue `CancelIoEx` during `WindowsWatcher.stop()` (since `ReadDirectoryChangesW` returns `TRUE` even when `STATUS_PENDING`), restoring sub-millisecond Windows shutdown.
+
 ## 0.2.8
 
 - Switch Windows `ReadDirectoryChangesW` to `OVERLAPPED` I/O and wait until the initial kernel notification buffer is armed before `start()`/`astart()` returns, eliminating missed early file events right after watcher startup.
