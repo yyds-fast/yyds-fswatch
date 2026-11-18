@@ -671,9 +671,10 @@ class TestFSWatcherRegressions(unittest.TestCase):
                 ignore_common_dirs=False,
             ) as watcher:
                 target.write_text("v1", encoding="utf-8")
-                deadline = asyncio.get_running_loop().time() + 1.0
+                deadline = asyncio.get_running_loop().time() + 2.0
                 while asyncio.get_running_loop().time() < deadline:
-                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    remaining = max(deadline - asyncio.get_running_loop().time(), 0.05)
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=remaining)
                     if Path(event.src_path) == target:
                         self.assertEqual(event.event_type, "created")
                         break
@@ -689,9 +690,10 @@ class TestFSWatcherRegressions(unittest.TestCase):
                 temp.write_text("v2", encoding="utf-8")
                 os.replace(temp, target)
 
-                deadline = asyncio.get_running_loop().time() + 1.0
+                deadline = asyncio.get_running_loop().time() + 2.0
                 while asyncio.get_running_loop().time() < deadline:
-                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    remaining = max(deadline - asyncio.get_running_loop().time(), 0.05)
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=remaining)
                     if Path(event.src_path) == target:
                         return event
                 self.fail("did not receive replacement event for target.txt")
@@ -1006,9 +1008,15 @@ class TestFSWatcherRegressions(unittest.TestCase):
             ) as watcher:
                 watcher._push_to_debounce("deleted", target, False)
                 watcher._push_to_debounce("created", target, True)
-                ev1 = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
-                ev2 = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
-                return ev1, ev2
+                matched = []
+                deadline = asyncio.get_running_loop().time() + 1.5
+                while len(matched) < 2 and asyncio.get_running_loop().time() < deadline:
+                    remaining = max(deadline - asyncio.get_running_loop().time(), 0.05)
+                    ev = await asyncio.wait_for(watcher.__anext__(), timeout=remaining)
+                    if Path(ev.src_path) == target:
+                        matched.append(ev)
+                self.assertEqual(len(matched), 2)
+                return matched[0], matched[1]
 
         ev1, ev2 = asyncio.run(run())
         self.assertEqual((ev1.event_type, ev1.is_directory), ("deleted", False))
@@ -1028,9 +1036,15 @@ class TestFSWatcherRegressions(unittest.TestCase):
             ) as watcher:
                 watcher._push_to_debounce("created", child, False)
                 watcher._push_to_debounce("moved", dir_a, True, dest_path=dir_b)
-                ev1 = await asyncio.wait_for(watcher.__anext__(), timeout=0.2)
-                ev2 = await asyncio.wait_for(watcher.__anext__(), timeout=0.2)
-                return ev1, ev2
+                matched = []
+                deadline = asyncio.get_running_loop().time() + 1.5
+                while len(matched) < 2 and asyncio.get_running_loop().time() < deadline:
+                    remaining = max(deadline - asyncio.get_running_loop().time(), 0.05)
+                    ev = await asyncio.wait_for(watcher.__anext__(), timeout=remaining)
+                    if Path(ev.src_path) in {child, dir_a}:
+                        matched.append(ev)
+                self.assertEqual(len(matched), 2)
+                return matched[0], matched[1]
 
         ev1, ev2 = asyncio.run(run())
         self.assertEqual((ev1.event_type, Path(ev1.src_path)), ("created", child))
@@ -1114,21 +1128,27 @@ class TestFSWatcherRegressions(unittest.TestCase):
 
         @watcher.on("*")
         def on_any(event):
+            # Ignore incidental startup events on self.root (e.g., macOS FSEvents)
+            if not Path(event.src_path).name.startswith("f_"):
+                return
             handled.append(event)
             watcher.stop()
 
         async def run():
             loop_task = asyncio.create_task(watcher._run_decorator_loop())
-            deadline = asyncio.get_running_loop().time() + 2.0
-            while not watcher.is_ready:
+            deadline = asyncio.get_running_loop().time() + 3.0
+            while not watcher.is_ready and not loop_task.done():
                 if asyncio.get_running_loop().time() >= deadline:
                     self.fail("watcher did not become ready")
                 await asyncio.sleep(0.01)
+            if loop_task.done():
+                await loop_task
+                self.fail("decorator loop exited before backlog was queued")
 
             for idx in range(50):
                 watcher._push_to_debounce("created", self.root / f"f_{idx}.txt", False)
 
-            await asyncio.wait_for(loop_task, timeout=1.0)
+            await asyncio.wait_for(loop_task, timeout=2.0)
 
         asyncio.run(run())
         self.assertEqual(len(handled), 1)

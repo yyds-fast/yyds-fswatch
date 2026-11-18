@@ -25,6 +25,7 @@ FILE_SHARE_WRITE = 0x0002
 FILE_SHARE_DELETE = 0x0004
 OPEN_EXISTING = 3
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_FLAG_OVERLAPPED = 0x40000000
 
 FILE_NOTIFY_CHANGE_FILE_NAME = 0x0001
 FILE_NOTIFY_CHANGE_DIR_NAME = 0x0002
@@ -33,14 +34,30 @@ FILE_NOTIFY_CHANGE_SIZE = 0x0008
 FILE_NOTIFY_CHANGE_ATTRIBUTES = 0x0004
 FILE_NOTIFY_CHANGE_CREATION = 0x0040
 
-# CancelSynchronousIo requires a thread handle opened with this access right.
-THREAD_TERMINATE = 0x0001
+ERROR_MORE_DATA = 234
+ERROR_OPERATION_ABORTED = 995
+ERROR_IO_PENDING = 997
+ERROR_NOTIFY_ENUM_DIR = 1022
+
+WAIT_OBJECT_0 = 0x00000000
+INFINITE = 0xFFFFFFFF
 
 NOTIFY_FILTER = (FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                  FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE |
                  FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_CREATION)
 
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+
+class OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
 
 # Function Bindings
 CreateFileW = kernel32.CreateFileW
@@ -63,7 +80,7 @@ ReadDirectoryChangesW.argtypes = [
     wintypes.BOOL,
     wintypes.DWORD,
     ctypes.POINTER(wintypes.DWORD),
-    ctypes.c_void_p,
+    ctypes.POINTER(OVERLAPPED),
     ctypes.c_void_p
 ]
 ReadDirectoryChangesW.restype = wintypes.BOOL
@@ -76,13 +93,39 @@ GetCurrentThreadId = kernel32.GetCurrentThreadId
 GetCurrentThreadId.argtypes = []
 GetCurrentThreadId.restype = wintypes.DWORD
 
-OpenThread = kernel32.OpenThread
-OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-OpenThread.restype = wintypes.HANDLE
+CreateEventW = kernel32.CreateEventW
+CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+CreateEventW.restype = wintypes.HANDLE
 
-CancelSynchronousIo = kernel32.CancelSynchronousIo
-CancelSynchronousIo.argtypes = [wintypes.HANDLE]
-CancelSynchronousIo.restype = wintypes.BOOL
+SetEvent = kernel32.SetEvent
+SetEvent.argtypes = [wintypes.HANDLE]
+SetEvent.restype = wintypes.BOOL
+
+ResetEvent = kernel32.ResetEvent
+ResetEvent.argtypes = [wintypes.HANDLE]
+ResetEvent.restype = wintypes.BOOL
+
+WaitForMultipleObjects = kernel32.WaitForMultipleObjects
+WaitForMultipleObjects.argtypes = [
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.HANDLE),
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
+WaitForMultipleObjects.restype = wintypes.DWORD
+
+GetOverlappedResult = kernel32.GetOverlappedResult
+GetOverlappedResult.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(OVERLAPPED),
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.BOOL,
+]
+GetOverlappedResult.restype = wintypes.BOOL
+
+CancelIo = kernel32.CancelIo
+CancelIo.argtypes = [wintypes.HANDLE]
+CancelIo.restype = wintypes.BOOL
 
 class WindowsWatcher(BaseWatcher):
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop, 
@@ -101,6 +144,7 @@ class WindowsWatcher(BaseWatcher):
         self._starting = False
         self._running = False
         self._stop_event = threading.Event()
+        self._stop_win_event = None
         self._directory_paths = set()
         self._dir_lock = threading.Lock()
         self._worker_thread_ids = set()
@@ -223,6 +267,22 @@ class WindowsWatcher(BaseWatcher):
         with self._dir_lock:
             return path.absolute() in self._directory_paths
 
+    def _report_backend_error(self, watch_path: Path, err: int):
+        exception = OSError(
+            err,
+            f"ReadDirectoryChangesW failed for {watch_path}: {ctypes.FormatError(err)}",
+        )
+        try:
+            self.loop.call_soon_threadsafe(
+                self.loop.call_exception_handler,
+                {
+                    "message": "yyds-fswatch Windows backend failed",
+                    "exception": exception,
+                },
+            )
+        except RuntimeError:
+            pass
+
     def start(self):
         if self._running:
             raise RuntimeError("Windows watcher is already running")
@@ -234,6 +294,12 @@ class WindowsWatcher(BaseWatcher):
         with self._worker_lock:
             self._worker_thread_ids.clear()
         try:
+            stop_win_event = CreateEventW(None, True, False, None)
+            if not stop_win_event:
+                err = ctypes.get_last_error()
+                raise OSError(err, f"CreateEventW failed: {ctypes.FormatError(err)}")
+            self._stop_win_event = stop_win_event
+
             for path in self.paths:
                 path = path.resolve()
                 try:
@@ -250,7 +316,7 @@ class WindowsWatcher(BaseWatcher):
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     None,
                     OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
                     None
                 )
 
@@ -261,14 +327,28 @@ class WindowsWatcher(BaseWatcher):
                 self._handles.append(hDir)
                 self._watched_inodes[path] = (st.st_dev, st.st_ino)
 
+                worker_ready = threading.Event()
+                worker_error = []
                 thread = threading.Thread(
                     target=self._watch_handle,
-                    args=(hDir, path, self._stop_event, watch_recursive),
+                    args=(
+                        hDir,
+                        path,
+                        self._stop_event,
+                        stop_win_event,
+                        watch_recursive,
+                        worker_ready,
+                        worker_error,
+                    ),
                     name=f"yyds-fswatch:{path}",
                     daemon=True,
                 )
                 thread.start()
                 self._threads.append(thread)
+                if not worker_ready.wait(timeout=5.0):
+                    raise TimeoutError(f"ReadDirectoryChangesW did not arm within 5s for {path}")
+                if worker_error:
+                    raise worker_error[0]
         except Exception:
             self.stop()
             raise
@@ -283,26 +363,18 @@ class WindowsWatcher(BaseWatcher):
     def stop(self):
         self._running = False
         self._stop_event.set()
+        if self._stop_win_event:
+            SetEvent(self._stop_win_event)
 
-        # ReadDirectoryChangesW is issued synchronously in each worker. Closing
-        # its directory handle alone does not reliably unblock another thread's
-        # pending I/O, which used to make every watcher shutdown wait for the
-        # join timeout. Explicitly cancel the workers' synchronous I/O first.
-        with self._worker_lock:
-            worker_thread_ids = tuple(self._worker_thread_ids)
-        for thread_id in worker_thread_ids:
-            thread_handle = OpenThread(THREAD_TERMINATE, False, thread_id)
-            if thread_handle:
-                try:
-                    CancelSynchronousIo(thread_handle)
-                finally:
-                    CloseHandle(thread_handle)
-
+        for t in self._threads:
+            t.join(timeout=1.0)
+        alive = any(t.is_alive() for t in self._threads)
         for h in self._handles:
             if h not in (INVALID_HANDLE_VALUE, None):
                 CloseHandle(h)
-        for t in self._threads:
-            t.join(timeout=1.0)
+        if self._stop_win_event and not alive:
+            CloseHandle(self._stop_win_event)
+            self._stop_win_event = None
         self._handles.clear()
         self._threads.clear()
         self._watched_inodes.clear()
@@ -315,7 +387,9 @@ class WindowsWatcher(BaseWatcher):
         await self._run_in_helper_thread(self.stop, "yyds-fswatch-win32-stop")
 
     def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path,
-                      stop_event: threading.Event, watch_recursive: bool):
+                      stop_event: threading.Event, stop_win_event: wintypes.HANDLE,
+                      watch_recursive: bool, worker_ready: threading.Event,
+                      worker_error: list):
         buf = ctypes.create_string_buffer(65536)
         bytes_returned = wintypes.DWORD(0)
         worker_thread_id = GetCurrentThreadId()
@@ -323,64 +397,107 @@ class WindowsWatcher(BaseWatcher):
         with self._worker_lock:
             self._worker_thread_ids.add(worker_thread_id)
 
-        # Win32 Error codes for overflow detection
-        ERROR_MORE_DATA = 234
-        ERROR_NOTIFY_ENUM_DIR = 1022
+        io_event = CreateEventW(None, True, False, None)
+        if not io_event:
+            err = ctypes.get_last_error()
+            worker_error.append(OSError(err, f"CreateEventW failed: {ctypes.FormatError(err)}"))
+            worker_ready.set()
+            with self._worker_lock:
+                self._worker_thread_ids.discard(worker_thread_id)
+            return
+
+        overlapped = OVERLAPPED()
+        wait_handles = (wintypes.HANDLE * 2)(io_event, stop_win_event)
+        io_pending = False
 
         try:
             while not stop_event.is_set():
-                success = ReadDirectoryChangesW(
+                ResetEvent(io_event)
+                overlapped.Internal = 0
+                overlapped.InternalHigh = 0
+                overlapped.Offset = 0
+                overlapped.OffsetHigh = 0
+                overlapped.hEvent = io_event
+
+                issued = ReadDirectoryChangesW(
                     hDir,
                     buf,
                     ctypes.sizeof(buf),
                     watch_recursive,
                     NOTIFY_FILTER,
-                    ctypes.byref(bytes_returned),
                     None,
+                    ctypes.byref(overlapped),
                     None
                 )
-
-                if not success:
-                    err = ctypes.get_last_error()
-                    if stop_event.is_set():
+                err = 0 if issued else ctypes.get_last_error()
+                if not issued and err != ERROR_IO_PENDING:
+                    if not worker_ready.is_set():
+                        worker_error.append(
+                            OSError(
+                                err,
+                                f"ReadDirectoryChangesW failed for {watch_path}: {ctypes.FormatError(err)}",
+                            )
+                        )
+                        worker_ready.set()
+                        break
+                    if stop_event.is_set() or err == ERROR_OPERATION_ABORTED:
                         break
                     if err in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
-                        # Buffer overflow occurred
                         self.on_raw_event("overflow", watch_path, is_dir=False)
                         continue
-                    else:
-                        exception = OSError(
-                            err,
-                            f"ReadDirectoryChangesW failed for {watch_path}: {ctypes.FormatError(err)}",
-                        )
-                        try:
-                            self.loop.call_soon_threadsafe(
-                                self.loop.call_exception_handler,
-                                {
-                                    "message": "yyds-fswatch Windows backend failed",
-                                    "exception": exception,
-                                },
-                            )
-                        except RuntimeError:
-                            pass
+                    self._report_backend_error(watch_path, err)
+                    break
+
+                io_pending = True
+                if not worker_ready.is_set():
+                    # Kernel directory-change buffer is now armed on hDir.
+                    worker_ready.set()
+
+                if not issued:
+                    wait_rc = WaitForMultipleObjects(2, wait_handles, False, INFINITE)
+                    if wait_rc == WAIT_OBJECT_0 + 1 or stop_event.is_set():
+                        break
+                    if wait_rc != WAIT_OBJECT_0:
+                        werr = ctypes.get_last_error()
+                        if not stop_event.is_set():
+                            self._report_backend_error(watch_path, werr)
                         break
 
-                if bytes_returned.value == 0:
+                ok = GetOverlappedResult(
+                    hDir,
+                    ctypes.byref(overlapped),
+                    ctypes.byref(bytes_returned),
+                    True,
+                )
+                io_pending = False
+                if not ok:
+                    gerr = ctypes.get_last_error()
+                    if stop_event.is_set() or gerr == ERROR_OPERATION_ABORTED:
+                        break
+                    if gerr in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
+                        self.on_raw_event("overflow", watch_path, is_dir=False)
+                        continue
+                    self._report_backend_error(watch_path, gerr)
+                    break
+
+                raw_size = bytes_returned.value
+                if raw_size == 0:
                     # Buffer overflow occurred (ReadDirectoryChangesW returns success but 0 bytes)
                     self.on_raw_event("overflow", watch_path, is_dir=False)
                     continue
 
+                packet_bytes = buf.raw[:raw_size]
                 events_in_packet = []
                 offset = 0
                 while True:
-                    if offset + 12 > bytes_returned.value:
+                    if offset + 12 > raw_size:
                         break
 
-                    next_offset, action, name_len = struct.unpack_from("III", buf.raw, offset)
-                    if offset + 12 + name_len > bytes_returned.value:
+                    next_offset, action, name_len = struct.unpack_from("III", packet_bytes, offset)
+                    if offset + 12 + name_len > raw_size:
                         break
 
-                    name_bytes = buf.raw[offset + 12 : offset + 12 + name_len]
+                    name_bytes = packet_bytes[offset + 12 : offset + 12 + name_len]
                     name = name_bytes.decode('utf-16le', errors='replace')
 
                     event_path = watch_path / name
@@ -453,5 +570,16 @@ class WindowsWatcher(BaseWatcher):
                     else:
                         i += 1
         finally:
+            if io_pending:
+                CancelIo(hDir)
+                GetOverlappedResult(
+                    hDir,
+                    ctypes.byref(overlapped),
+                    ctypes.byref(bytes_returned),
+                    True,
+                )
+            CloseHandle(io_event)
+            if not worker_ready.is_set():
+                worker_ready.set()
             with self._worker_lock:
                 self._worker_thread_ids.discard(worker_thread_id)

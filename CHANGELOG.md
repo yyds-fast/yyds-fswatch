@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.8
+
+- Switch Windows `ReadDirectoryChangesW` to `OVERLAPPED` I/O and wait until the initial kernel notification buffer is armed before `start()`/`astart()` returns, eliminating missed early file events right after watcher startup.
+- Filter incidental root startup events (such as macOS `FSEvents` directory notifications) in decorator-stop and synthetic debounce regression tests.
+
 ## 0.2.7
 
 - Fix nested directory-only gitignore globs (`temp*/`), Git whitelist patterns (`["*", "!*/", "!*.py"]`), and backslash-escaped literals (`\#`, `\!`, `\ `) in `GitIgnoreFilter`.
