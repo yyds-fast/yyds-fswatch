@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.7
+
+- Fix nested directory-only gitignore globs (`temp*/`), Git whitelist patterns (`["*", "!*/", "!*.py"]`), and backslash-escaped literals (`\#`, `\!`, `\ `) in `GitIgnoreFilter`.
+- Avoid redundant `lru_cache` invalidation on plain directory deletions, add `is_ignored_canonical` to skip duplicate `realpath`/`lstat` syscalls, and replace `Path.relative_to()` subtree loops with normalized string-prefix checks (~15x faster).
+- Reconcile `inotify` and Windows directory watches dynamically when `.gitignore` rules change at runtime, open Linux `inotify` descriptors atomically with `O_NONBLOCK | O_CLOEXEC` (`inotify_init1`), switch Linux event buffering to `bytearray` with bounded per-tick reads, and emit `overflow` when runtime `inotify_add_watch` hits `ENOSPC`/`EMFILE`.
+- Fix macOS `CFArrayCreate` `kCFTypeArrayCallBacks` retention, `CFRunLoop` retain/release thread safety, and `stop()`-before-`CFRunLoopRun` shutdown races; switch Windows `ctypes.WinDLL(..., use_last_error=True)` error handling and root inode health checks; offload blocking native `astart()`/`aclose()` calls from the caller's asyncio loop.
+- Include `(st_mtime_ns, st_size)` in `PollingWatcher` file move identity to prevent `ext4` immediate inode reuse on `unlink + create` from misreporting unrelated files as `moved`.
+- Emit `created` events for entries created alongside newly appeared/recreated watched roots, flush pending subtree events before directory `moved`, preserve separate events on file-to-directory replacements within debounce windows, guard cross-mode re-entry, and halt iteration/callbacks immediately on `stop()`.
+
 ## 0.2.6
 
 - Normalize plain `created` atomic-replacement events for already-observed files in directory-watch mode to `modified` (fixing macOS `FSEvents` directory atomic saves).

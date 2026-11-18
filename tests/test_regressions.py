@@ -963,6 +963,204 @@ class TestFSWatcherRegressions(unittest.TestCase):
         self.assertIn((("moved", old_file, False), {"dest_path": new_file}), events)
         self.assertIn((("moved", old_dir, True), {"dest_path": new_dir}), events)
 
+    def test_polling_diff_does_not_misreport_reused_inode_unlink_plus_create_as_move(self):
+        unlinked = self.root / "a.txt"
+        created_unrelated = self.root / "b.json"
+        renamed_old = self.root / "c.txt"
+        renamed_new = self.root / "d.txt"
+        events = []
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        watcher = PollingWatcher(
+            [self.root], True, loop,
+            lambda event_type, path, is_dir, **kwargs: events.append(
+                (event_type, path, is_dir, kwargs.get("dest_path"))
+            ),
+        )
+        old = {
+            self.root: (100, 4096, True, 1, 1),
+            unlinked: (100, 10, False, 1, 42),
+            renamed_old: (300, 15, False, 1, 99),
+        }
+        new = {
+            self.root: (200, 4096, True, 1, 1),
+            # Same inode 42 reused immediately, but fresh mtime & size:
+            created_unrelated: (200, 25, False, 1, 42),
+            # Genuine rename preserves inode, mtime, and size:
+            renamed_new: (300, 15, False, 1, 99),
+        }
+        watcher._diff(old, new)
+        self.assertIn(("moved", renamed_old, False, renamed_new), events)
+        self.assertIn(("deleted", unlinked, False, None), events)
+        self.assertIn(("created", created_unrelated, False, None), events)
+
+    def test_debounce_file_to_directory_replacement_emits_delete_then_create(self):
+        target = self.root / "morph"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.05,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                watcher._push_to_debounce("deleted", target, False)
+                watcher._push_to_debounce("created", target, True)
+                ev1 = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
+                ev2 = await asyncio.wait_for(watcher.__anext__(), timeout=0.5)
+                return ev1, ev2
+
+        ev1, ev2 = asyncio.run(run())
+        self.assertEqual((ev1.event_type, ev1.is_directory), ("deleted", False))
+        self.assertEqual((ev2.event_type, ev2.is_directory), ("created", True))
+
+    def test_directory_move_flushes_pending_child_events_first(self):
+        dir_a = self.root / "dir_a"
+        dir_b = self.root / "dir_b"
+        child = dir_a / "child.txt"
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.25,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                watcher._push_to_debounce("created", child, False)
+                watcher._push_to_debounce("moved", dir_a, True, dest_path=dir_b)
+                ev1 = await asyncio.wait_for(watcher.__anext__(), timeout=0.2)
+                ev2 = await asyncio.wait_for(watcher.__anext__(), timeout=0.2)
+                return ev1, ev2
+
+        ev1, ev2 = asyncio.run(run())
+        self.assertEqual((ev1.event_type, Path(ev1.src_path)), ("created", child))
+        self.assertEqual(
+            (ev2.event_type, Path(ev2.src_path), Path(ev2.dest_path)),
+            ("moved", dir_a, dir_b),
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify-specific regression")
+    def test_linux_dynamic_gitignore_unignore_reconciles_directory_watches(self):
+        gitignore = self.root / ".gitignore"
+        logs_dir = self.root / "logs"
+        gitignore.write_text("logs/\n", encoding="utf-8")
+        logs_dir.mkdir()
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                debounce=0.01,
+                use_gitignore=True,
+                ignore_common_dirs=False,
+            ) as watcher:
+                self.assertNotIn(logs_dir, watcher._watcher._path_to_wd)
+
+                gitignore.write_text("", encoding="utf-8")
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while logs_dir not in watcher._watcher._path_to_wd:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        self.fail("logs/ was not registered after .gitignore un-ignored it")
+                    await asyncio.sleep(0.01)
+
+                log_file = logs_dir / "app.log"
+                log_file.write_text("hello", encoding="utf-8")
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    if Path(event.src_path) == log_file:
+                        return event
+                self.fail("did not receive event inside newly un-ignored logs/")
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "created")
+
+    def test_recovery_emits_initial_entries_created_with_missing_root(self):
+        missing_root = self.base_dir / "future_root"
+        boot_file = missing_root / "sub" / "boot.txt"
+
+        async def run():
+            async with FSWatcher(
+                missing_root,
+                target_type="directory",
+                debounce=0.01,
+                recovery_interval=0.03,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                os.makedirs(boot_file.parent)
+                boot_file.write_text("ready", encoding="utf-8")
+
+                deadline = asyncio.get_running_loop().time() + 1.5
+                while asyncio.get_running_loop().time() < deadline:
+                    try:
+                        event = await asyncio.wait_for(watcher.__anext__(), timeout=0.3)
+                    except asyncio.TimeoutError:
+                        continue
+                    if Path(event.src_path) == boot_file:
+                        return event
+                self.fail("did not receive created event for file created together with missing root")
+
+        event = asyncio.run(run())
+        self.assertEqual(event.event_type, "created")
+
+    def test_stop_halts_decorator_loop_immediately_despite_queue_backlog(self):
+        watcher = FSWatcher(
+            self.root,
+            debounce=0,
+            use_gitignore=False,
+            ignore_common_dirs=False,
+        )
+        handled = []
+
+        @watcher.on("*")
+        def on_any(event):
+            handled.append(event)
+            watcher.stop()
+
+        async def run():
+            loop_task = asyncio.create_task(watcher._run_decorator_loop())
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while not watcher.is_ready:
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("watcher did not become ready")
+                await asyncio.sleep(0.01)
+
+            for idx in range(50):
+                watcher._push_to_debounce("created", self.root / f"f_{idx}.txt", False)
+
+            await asyncio.wait_for(loop_task, timeout=1.0)
+
+        asyncio.run(run())
+        self.assertEqual(len(handled), 1)
+
+    def test_concurrent_context_reentry_raises_without_stopping_active_watcher(self):
+        async def run():
+            async with FSWatcher(
+                self.root,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                with self.assertRaises(RuntimeError):
+                    watcher.__enter__()
+                self.assertTrue(watcher.is_running)
+
+        asyncio.run(run())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify-specific regression")
+    def test_linux_inotify_fd_has_cloexec_flag(self):
+        import fcntl
+
+        async def run():
+            async with FSWatcher(
+                self.root,
+                use_gitignore=False,
+                ignore_common_dirs=False,
+            ) as watcher:
+                flags = fcntl.fcntl(watcher._watcher._fd, fcntl.F_GETFD)
+                return bool(flags & fcntl.FD_CLOEXEC)
+
+        self.assertTrue(asyncio.run(run()))
+
 
 if __name__ == "__main__":
     unittest.main()

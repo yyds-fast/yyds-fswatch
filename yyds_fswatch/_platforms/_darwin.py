@@ -36,6 +36,17 @@ CFRelease = cf.CFRelease
 CFRelease.argtypes = [ctypes.c_void_p]
 CFRelease.restype = None
 
+CFRetain = cf.CFRetain
+CFRetain.argtypes = [ctypes.c_void_p]
+CFRetain.restype = ctypes.c_void_p
+
+try:
+    _kCFTypeArrayCallBacks = ctypes.addressof(
+        ctypes.c_void_p.in_dll(cf, "kCFTypeArrayCallBacks")
+    )
+except (ValueError, AttributeError):
+    _kCFTypeArrayCallBacks = None
+
 kCFStringEncodingUTF8 = 0x08000100
 
 FSEventStreamCreate = cs.FSEventStreamCreate
@@ -77,6 +88,10 @@ CFRunLoopGetCurrent.restype = ctypes.c_void_p
 CFRunLoopRun = cf.CFRunLoopRun
 CFRunLoopRun.argtypes = []
 CFRunLoopRun.restype = None
+
+CFRunLoopRunInMode = cf.CFRunLoopRunInMode
+CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
+CFRunLoopRunInMode.restype = ctypes.c_int32
 
 CFRunLoopStop = cf.CFRunLoopStop
 CFRunLoopStop.argtypes = [ctypes.c_void_p]
@@ -124,6 +139,7 @@ class DarwinWatcher(BaseWatcher):
         )
         self._stream = None
         self._run_loop = None
+        self._state_lock = threading.Lock()
         self._thread = None
         self._callback_ref = None
         self._started_event = threading.Event()
@@ -156,10 +172,14 @@ class DarwinWatcher(BaseWatcher):
             self.stop()
             raise RuntimeError("FSEvents stream failed to start") from self._startup_error
 
+    async def astart(self):
+        await self._run_in_helper_thread(self.start, "yyds-fswatch-fsevents-start")
+
     def stop(self):
         self._stop_requested.set()
-        if self._run_loop:
-            CFRunLoopStop(self._run_loop)
+        with self._state_lock:
+            if self._run_loop:
+                CFRunLoopStop(self._run_loop)
         if self._thread:
             self._thread.join(timeout=2.0)
         if self._thread is not None and self._thread.is_alive():
@@ -167,9 +187,11 @@ class DarwinWatcher(BaseWatcher):
             # may still invoke the callback can crash the interpreter.
             return
         self._stream = None
-        self._run_loop = None
         self._thread = None
         self._callback_ref = None
+
+    async def aclose(self):
+        await self._run_in_helper_thread(self.stop, "yyds-fswatch-fsevents-stop")
 
     def _run_stream(self):
         try:
@@ -190,6 +212,7 @@ class DarwinWatcher(BaseWatcher):
     def _run_stream_impl(self):
         c_strings = []
         cf_paths = None
+        default_mode = None
         stream_started = False
         try:
             for path in self.paths:
@@ -205,7 +228,12 @@ class DarwinWatcher(BaseWatcher):
                 raise FileNotFoundError("no watch path currently exists")
 
             paths_array = (ctypes.c_void_p * len(c_strings))(*c_strings)
-            cf_paths = CFArrayCreate(None, paths_array, len(c_strings), None)
+            cf_paths = CFArrayCreate(
+                None,
+                paths_array,
+                len(c_strings),
+                _kCFTypeArrayCallBacks,
+            )
             if not cf_paths:
                 raise OSError("CFArrayCreate failed")
 
@@ -222,14 +250,22 @@ class DarwinWatcher(BaseWatcher):
             if not self._stream:
                 raise OSError("FSEventStreamCreate failed")
 
-            # FSEventStreamCreate retains the path array.
+            # FSEventStreamCreate retains cf_paths; release local CFStrings only
+            # when kCFTypeArrayCallBacks retained them inside cf_paths.
             CFRelease(cf_paths)
             cf_paths = None
-            for cf_string in c_strings:
-                CFRelease(cf_string)
-            c_strings.clear()
+            if _kCFTypeArrayCallBacks is not None:
+                for cf_string in c_strings:
+                    CFRelease(cf_string)
+                c_strings.clear()
 
-            self._run_loop = CFRunLoopGetCurrent()
+            run_loop = CFRunLoopGetCurrent()
+            if not run_loop:
+                raise OSError("CFRunLoopGetCurrent failed")
+            CFRetain(run_loop)
+            with self._state_lock:
+                self._run_loop = run_loop
+
             default_mode = CFStringCreateWithCString(
                 None,
                 b"kCFRunLoopDefaultMode",
@@ -237,19 +273,21 @@ class DarwinWatcher(BaseWatcher):
             )
             if not default_mode:
                 raise OSError("failed to create the FSEvents run-loop mode")
-            try:
-                FSEventStreamScheduleWithRunLoop(self._stream, self._run_loop, default_mode)
-            finally:
-                CFRelease(default_mode)
+            FSEventStreamScheduleWithRunLoop(self._stream, run_loop, default_mode)
 
             if not FSEventStreamStart(self._stream):
                 raise OSError("FSEventStreamStart failed")
             stream_started = True
             self._started_event.set()
 
-            if not self._stop_requested.is_set():
-                CFRunLoopRun()
+            # Bounded CFRunLoopRunInMode slices avoid hanging if stop() fired
+            # right before the thread entered the run loop, while CFRunLoopStop
+            # still wakes an active slice immediately.
+            while not self._stop_requested.is_set():
+                CFRunLoopRunInMode(default_mode, 0.2, False)
         finally:
+            if default_mode:
+                CFRelease(default_mode)
             if cf_paths:
                 CFRelease(cf_paths)
             for cf_string in c_strings:
@@ -260,7 +298,11 @@ class DarwinWatcher(BaseWatcher):
                 FSEventStreamInvalidate(self._stream)
                 FSEventStreamRelease(self._stream)
             self._stream = None
-            self._run_loop = None
+            with self._state_lock:
+                run_loop = self._run_loop
+                self._run_loop = None
+            if run_loop:
+                CFRelease(run_loop)
 
     def _emit_if_visible(self, event_type: str, path: Path, is_dir: bool,
                          dest_path: Path = None):

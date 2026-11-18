@@ -10,12 +10,13 @@ import os
 import struct
 import threading
 from pathlib import Path
-from typing import List, Callable
+from typing import List, Callable, Dict, Tuple
 
+from ..ignore import path_prefix_pair, subtree_relative_suffix
 from ._base import BaseWatcher
 
-# Load DLL
-kernel32 = ctypes.windll.kernel32
+# Load DLL with thread-local Win32 LastError preservation
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 # Win32 Constants
 FILE_LIST_DIRECTORY = 0x0001
@@ -96,6 +97,8 @@ class WindowsWatcher(BaseWatcher):
         )
         self._handles: List[wintypes.HANDLE] = []
         self._threads: List[threading.Thread] = []
+        self._watched_inodes: Dict[Path, Tuple[int, int]] = {}
+        self._starting = False
         self._running = False
         self._stop_event = threading.Event()
         self._directory_paths = set()
@@ -109,6 +112,24 @@ class WindowsWatcher(BaseWatcher):
             thread.is_alive() for thread in self._threads
         )
 
+    def is_healthy_for(self, paths: List[Path]) -> bool:
+        if self._starting and self._running:
+            return True
+        if not self.is_running:
+            return False
+        for path in paths:
+            resolved = path.resolve()
+            try:
+                st = os.stat(resolved)
+            except OSError:
+                continue
+            if resolved not in self._watched_inodes:
+                return False
+            expected = self._watched_inodes.get(resolved)
+            if expected is not None and expected[1] and st.st_ino and (st.st_dev, st.st_ino) != expected:
+                return False
+        return True
+
     def _add_directory_recursive_to_set(self, path: Path, recurse: bool = True):
         path_abs = path.absolute()
         found = {path_abs}
@@ -116,14 +137,18 @@ class WindowsWatcher(BaseWatcher):
         if recurse:
             try:
                 for root, dirs, files in os.walk(path):
+                    if self._stop_event.is_set():
+                        return
                     root_path = Path(root)
-                    if self._ignore_filter:
-                        if self._ignore_filter.is_ignored(root_path, is_dir=True):
+                    filt = self._ignore_filter
+                    ignore_fn = getattr(filt, "is_ignored", None) if filt is not None else None
+                    if ignore_fn is not None:
+                        if ignore_fn(root_path, is_dir=True):
                             dirs[:] = []
                             continue
                         dirs[:] = [
                             d for d in dirs
-                            if not self._ignore_filter.is_ignored(root_path / d, is_dir=True)
+                            if not ignore_fn(root_path / d, is_dir=True)
                         ]
                     for d in dirs:
                         found.add((root_path / d).absolute())
@@ -133,38 +158,66 @@ class WindowsWatcher(BaseWatcher):
         with self._dir_lock:
             self._directory_paths.update(found)
 
+    def _reconcile_watches_sync(self):
+        if not self._running or not self.recursive or not self._recursive_roots:
+            return
+        filt = self._ignore_filter
+        ignore_fn = getattr(filt, "is_ignored", None) if filt is not None else None
+        if ignore_fn is not None:
+            with self._dir_lock:
+                candidates = list(self._directory_paths)
+            ignored_dirs = [
+                d for d in candidates
+                if d not in self._watched_roots and ignore_fn(d, True)
+            ]
+            if ignored_dirs:
+                with self._dir_lock:
+                    self._directory_paths.difference_update(ignored_dirs)
+        for path in self.paths:
+            if self._stop_event.is_set():
+                break
+            resolved = path.resolve()
+            if resolved.is_dir() and self._should_recurse_into(resolved, resolved=True):
+                self._add_directory_recursive_to_set(resolved, recurse=True)
+
+    def reconcile_watches(self):
+        if not self._running or not self.recursive or not self._recursive_roots:
+            return
+        if self.loop is not None and self.loop.is_running():
+            threading.Thread(
+                target=self._reconcile_watches_sync,
+                name="yyds-fswatch-win32-reconcile",
+                daemon=True,
+            ).start()
+        else:
+            self._reconcile_watches_sync()
+
     def _remove_directory_from_set(self, path: Path):
-        path_abs = path.absolute()
+        exact_norm, prefix_norm = path_prefix_pair(path.absolute())
         with self._dir_lock:
-            self._directory_paths.discard(path_abs)
-            to_remove = []
-            for directory in self._directory_paths:
-                try:
-                    directory.relative_to(path_abs)
-                except ValueError:
-                    continue
-                to_remove.append(directory)
+            to_remove = [
+                directory for directory in self._directory_paths
+                if subtree_relative_suffix(directory, exact_norm, prefix_norm) is not None
+            ]
             for p in to_remove:
                 self._directory_paths.discard(p)
 
     def _rename_directory_in_set(self, old_path: Path, new_path: Path):
         old_abs = old_path.absolute()
         new_abs = new_path.absolute()
+        exact_norm, prefix_norm = path_prefix_pair(old_abs)
         with self._dir_lock:
             subdirs = []
             for p in self._directory_paths:
-                try:
-                    rel = p.relative_to(old_abs)
-                    subdirs.append((p, new_abs / rel))
-                except ValueError:
+                suffix = subtree_relative_suffix(p, exact_norm, prefix_norm)
+                if suffix is None:
                     continue
+                dest = new_abs / suffix if suffix else new_abs
+                subdirs.append((p, dest))
             
             for old_p, new_p in subdirs:
                 self._directory_paths.discard(old_p)
                 self._directory_paths.add(new_p)
-            
-            self._directory_paths.discard(old_abs)
-            self._directory_paths.add(new_abs)
 
     def _is_path_directory(self, path: Path) -> bool:
         with self._dir_lock:
@@ -175,15 +228,19 @@ class WindowsWatcher(BaseWatcher):
             raise RuntimeError("Windows watcher is already running")
         self._running = True
         self._stop_event = threading.Event()
-        self._directory_paths.clear()
+        self._watched_inodes.clear()
+        with self._dir_lock:
+            self._directory_paths.clear()
         with self._worker_lock:
             self._worker_thread_ids.clear()
         try:
             for path in self.paths:
                 path = path.resolve()
-                if not path.exists():
+                try:
+                    st = os.stat(path)
+                except OSError:
                     continue
-                watch_recursive = self._should_recurse_into(path)
+                watch_recursive = self._should_recurse_into(path, resolved=True)
                 if path.is_dir():
                     self._add_directory_recursive_to_set(path, recurse=watch_recursive)
 
@@ -197,11 +254,12 @@ class WindowsWatcher(BaseWatcher):
                     None
                 )
 
-                if hDir == INVALID_HANDLE_VALUE:
-                    err = kernel32.GetLastError()
+                if hDir in (INVALID_HANDLE_VALUE, None):
+                    err = ctypes.get_last_error()
                     raise OSError(err, f"CreateFileW failed for {path}: {ctypes.FormatError(err)}")
 
                 self._handles.append(hDir)
+                self._watched_inodes[path] = (st.st_dev, st.st_ino)
 
                 thread = threading.Thread(
                     target=self._watch_handle,
@@ -214,6 +272,13 @@ class WindowsWatcher(BaseWatcher):
         except Exception:
             self.stop()
             raise
+
+    async def astart(self):
+        self._starting = True
+        try:
+            await self._run_in_helper_thread(self.start, "yyds-fswatch-win32-start")
+        finally:
+            self._starting = False
 
     def stop(self):
         self._running = False
@@ -234,16 +299,20 @@ class WindowsWatcher(BaseWatcher):
                     CloseHandle(thread_handle)
 
         for h in self._handles:
-            if h != INVALID_HANDLE_VALUE:
+            if h not in (INVALID_HANDLE_VALUE, None):
                 CloseHandle(h)
         for t in self._threads:
             t.join(timeout=1.0)
         self._handles.clear()
         self._threads.clear()
+        self._watched_inodes.clear()
         with self._dir_lock:
             self._directory_paths.clear()
         with self._worker_lock:
             self._worker_thread_ids.clear()
+
+    async def aclose(self):
+        await self._run_in_helper_thread(self.stop, "yyds-fswatch-win32-stop")
 
     def _watch_handle(self, hDir: wintypes.HANDLE, watch_path: Path,
                       stop_event: threading.Event, watch_recursive: bool):
@@ -272,9 +341,9 @@ class WindowsWatcher(BaseWatcher):
                 )
 
                 if not success:
+                    err = ctypes.get_last_error()
                     if stop_event.is_set():
                         break
-                    err = kernel32.GetLastError()
                     if err in (ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR):
                         # Buffer overflow occurred
                         self.on_raw_event("overflow", watch_path, is_dir=False)

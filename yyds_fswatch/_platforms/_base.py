@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import List, Callable
+
+from ..ignore import path_prefix_pair, subtree_relative_suffix
 
 class BaseWatcher:
     def __init__(self, paths: List[Path], recursive: bool, loop: asyncio.AbstractEventLoop,
@@ -19,21 +22,56 @@ class BaseWatcher:
             self._recursive_roots = self._watched_roots
         else:
             self._recursive_roots = frozenset()
+        self._recursive_prefixes = tuple(
+            path_prefix_pair(root) for root in self._recursive_roots
+        )
 
     def _should_recurse_into(self, path: Path, resolved: bool = False) -> bool:
         """Whether subdirectories under ``path`` should be watched recursively."""
-        if not self.recursive or not self._recursive_roots:
+        if not self.recursive or not self._recursive_prefixes:
             return False
         target = path if resolved else path.resolve()
-        for root in self._recursive_roots:
-            if target == root:
+        for exact_norm, prefix_norm in self._recursive_prefixes:
+            if subtree_relative_suffix(target, exact_norm, prefix_norm) is not None:
                 return True
-            try:
-                target.relative_to(root)
-                return True
-            except ValueError:
-                continue
         return False
+
+    async def _run_in_helper_thread(self, func: Callable, thread_name: str,
+                                    heartbeat: float = 0.05):
+        """Run a blocking backend lifecycle operation without stalling asyncio."""
+        running_loop = asyncio.get_running_loop()
+        done_flag = threading.Event()
+        done_async = asyncio.Event()
+        outcome = []
+
+        def worker():
+            try:
+                outcome.append((True, func()))
+            except BaseException as exc:
+                outcome.append((False, exc))
+            finally:
+                done_flag.set()
+                if not running_loop.is_closed():
+                    try:
+                        running_loop.call_soon_threadsafe(done_async.set)
+                    except RuntimeError:
+                        pass
+
+        thread = threading.Thread(target=worker, name=thread_name, daemon=True)
+        thread.start()
+        while not done_flag.is_set():
+            try:
+                await asyncio.wait_for(done_async.wait(), timeout=heartbeat)
+            except asyncio.TimeoutError:
+                pass
+        ok, value = outcome[0]
+        if not ok:
+            raise value
+        return value
+
+    def reconcile_watches(self):
+        """Reconcile backend directory watches after ignore rules change."""
+        return None
 
     def _should_skip_event(self, event_type: str, event_path: Path, is_dir: bool,
                            dest_path: Path = None) -> bool:

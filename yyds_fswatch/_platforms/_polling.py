@@ -197,16 +197,18 @@ class PollingWatcher(BaseWatcher):
                 break
             if not p.exists():
                 continue
+            resolved = p.resolve()
             self._scan_path(
                 p,
                 snapshot,
                 is_root=True,
-                recurse=self._should_recurse_into(p.resolve()),
+                recurse=self._should_recurse_into(resolved, resolved=True),
+                canonical=(p == resolved),
             )
         return snapshot
 
     def _scan_path(self, path: Path, snapshot: dict, is_root: bool = False,
-                   recurse: bool = False, entry_stat=None):
+                   recurse: bool = False, entry_stat=None, canonical: bool = False):
         if not self._running:
             return
         try:
@@ -217,6 +219,13 @@ class PollingWatcher(BaseWatcher):
             return
 
         if is_dir and (recurse or is_root):
+            filt = self._ignore_filter
+            ignore_fn = None
+            if filt is not None:
+                if canonical:
+                    ignore_fn = getattr(filt, "is_ignored_canonical", None) or getattr(filt, "is_ignored", None)
+                else:
+                    ignore_fn = getattr(filt, "is_ignored", None)
             try:
                 with os.scandir(path) as entries:
                     for entry in entries:
@@ -229,7 +238,7 @@ class PollingWatcher(BaseWatcher):
                             continue
 
                         # Apply ignore filter
-                        if self._ignore_filter and self._ignore_filter.is_ignored(entry_path, is_dir=entry_is_dir):
+                        if ignore_fn is not None and ignore_fn(entry_path, entry_is_dir):
                             continue
 
                         try:
@@ -244,6 +253,7 @@ class PollingWatcher(BaseWatcher):
                                 is_root=False,
                                 recurse=True,
                                 entry_stat=entry_st,
+                                canonical=canonical,
                             )
                         else:
                             snapshot[entry_path] = (
@@ -262,7 +272,13 @@ class PollingWatcher(BaseWatcher):
         # those values cannot safely be used to infer a rename.
         if not state[4]:
             return None
-        return state[3], state[4], state[2]
+        if state[2]:
+            return state[3], state[4], True
+        # Local filesystems such as ext4 immediately reuse freed inode numbers
+        # when one file is unlinked and an unrelated file is created in the
+        # same poll window. Require size and mtime to match for file moves, as
+        # rename() preserves both while unlink+create gets a fresh mtime/size.
+        return state[3], state[4], False, state[0], state[1]
 
     def _diff(self, old: Dict[Path, Tuple[int, int, bool, int, int]],
               new: Dict[Path, Tuple[int, int, bool, int, int]]):

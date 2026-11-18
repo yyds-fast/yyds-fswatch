@@ -9,6 +9,26 @@ from pathlib import Path
 from typing import List
 
 
+def path_prefix_pair(path: Path):
+    """Return normalized (exact, dir_prefix) strings for fast subtree checks."""
+    raw = str(path)
+    norm = os.path.normcase(raw)
+    if norm.endswith(os.sep):
+        return norm.rstrip(os.sep) or norm, norm
+    return norm, norm + os.sep
+
+
+def subtree_relative_suffix(candidate: Path, exact_norm: str, prefix_norm: str):
+    """Return '' if candidate == root, relative subpath str if descendant, else None."""
+    cand_str = str(candidate)
+    cand_norm = os.path.normcase(cand_str)
+    if cand_norm == exact_norm:
+        return ""
+    if cand_norm.startswith(prefix_norm):
+        return cand_str[len(prefix_norm):]
+    return None
+
+
 def canonicalize_watch_path(path: Path, roots_set) -> Path:
     """Resolve parent directories without dereferencing in-scope symlinks."""
     path = Path(path)
@@ -59,27 +79,51 @@ class GitIgnoreFilter:
         self._global_rules = []
         if ignore_patterns:
             for pattern in ignore_patterns:
-                pattern = pattern.strip()
-                if pattern and not pattern.startswith("#"):
-                    self._add_rule_to_list(pattern, self._global_rules)
+                cleaned = self._clean_pattern_line(pattern)
+                if cleaned is not None:
+                    self._add_rule_to_list(cleaned, self._global_rules)
 
         self._dir_rules = {}
         self._checked_dirs = set()
+        self._assume_canonical = False
 
         # Binding a bounded cache per instance keeps repeated hot-path checks
         # fast. Acquiring self._lock around the cache wrapper prevents a stale
         # lookup from populating the cache concurrently with notify_event/refresh.
-        # close() clears the cache and drops the closure to break reference cycles.
+        # close() clears the cache and drops the closures to break reference cycles.
         cached_lookup = lru_cache(maxsize=4096)(self._is_ignored_impl)
+        self._cached_lookup = cached_lookup
         lock = self._lock
 
         def is_ignored(path: Path, is_dir: bool = False) -> bool:
             with lock:
                 return cached_lookup(path, is_dir)
 
+        def is_ignored_canonical(path: Path, is_dir: bool = False) -> bool:
+            with lock:
+                prev = self._assume_canonical
+                self._assume_canonical = True
+                try:
+                    return cached_lookup(path, is_dir)
+                finally:
+                    self._assume_canonical = prev
+
         is_ignored.cache_info = cached_lookup.cache_info
         is_ignored.cache_clear = cached_lookup.cache_clear
         self.is_ignored = is_ignored
+        self.is_ignored_canonical = is_ignored_canonical
+
+    @staticmethod
+    def _clean_pattern_line(line: str):
+        line = line.rstrip("\r\n")
+        while (line.endswith(" ") or line.endswith("\t")) and not (
+            line.endswith("\\ ") or line.endswith("\\\t")
+        ):
+            line = line[:-1]
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            return None
+        return stripped
 
     def _canonicalize_path(self, path: Path) -> Path:
         return canonicalize_watch_path(path, self._roots_set)
@@ -87,9 +131,11 @@ class GitIgnoreFilter:
     def close(self):
         """Clear caches and break the bound-method reference cycle."""
         with self._lock:
-            if getattr(self, "is_ignored", None) is not None:
-                self.is_ignored.cache_clear()
-                self.is_ignored = None
+            if getattr(self, "_cached_lookup", None) is not None:
+                self._cached_lookup.cache_clear()
+                self._cached_lookup = None
+            self.is_ignored = None
+            self.is_ignored_canonical = None
             self._dir_rules.clear()
             self._checked_dirs.clear()
 
@@ -98,14 +144,21 @@ class GitIgnoreFilter:
         with self._lock:
             self._dir_rules.clear()
             self._checked_dirs.clear()
-            if self.is_ignored is not None:
-                self.is_ignored.cache_clear()
+            if self._cached_lookup is not None:
+                self._cached_lookup.cache_clear()
 
     def notify_event(self, event_type: str, path: Path, is_dir: bool,
-                     dest_path: Path = None):
-        """Invalidate rule state affected by a file-system event."""
+                     dest_path: Path = None) -> bool:
+        """Invalidate rule state affected by a file-system event.
+
+        Returns True when rule definitions may have changed (so callers with
+        pruned directory watches can reconcile them).
+        """
+        if not self._use_gitignore:
+            return False
         with self._lock:
-            changed = False
+            rules_changed = False
+            cache_dirty = False
             candidates = [Path(path)]
             if dest_path is not None:
                 candidates.append(Path(dest_path))
@@ -113,16 +166,25 @@ class GitIgnoreFilter:
             for candidate in candidates:
                 if candidate.name == ".gitignore":
                     self._invalidate_directory(candidate.parent)
-                    changed = True
+                    rules_changed = True
+                    cache_dirty = True
 
             if is_dir and event_type in {"deleted", "moved"}:
-                self._purge_subtree(Path(path))
+                _, src_rules = self._purge_subtree(Path(path))
+                if src_rules:
+                    rules_changed = True
+                    cache_dirty = True
                 if dest_path is not None:
-                    self._purge_subtree(Path(dest_path))
-                changed = True
+                    dest_checked, dest_rules = self._purge_subtree(Path(dest_path))
+                    if dest_rules:
+                        rules_changed = True
+                        cache_dirty = True
+                    elif event_type == "moved" and dest_checked:
+                        cache_dirty = True
 
-            if changed and self.is_ignored is not None:
-                self.is_ignored.cache_clear()
+            if cache_dirty and self._cached_lookup is not None:
+                self._cached_lookup.cache_clear()
+            return rules_changed
 
     def _invalidate_directory(self, directory: Path):
         directory = directory.resolve()
@@ -130,15 +192,19 @@ class GitIgnoreFilter:
         self._dir_rules.pop(directory, None)
 
     def _purge_subtree(self, path: Path):
-        path = path.resolve()
-        directories = set(self._checked_dirs) | set(self._dir_rules)
-        for directory in directories:
-            try:
-                directory.relative_to(path)
-            except ValueError:
-                continue
-            self._checked_dirs.discard(directory)
-            self._dir_rules.pop(directory, None)
+        resolved = path.resolve()
+        exact_norm, prefix_norm = path_prefix_pair(resolved)
+        checked_removed = False
+        rules_removed = False
+        for directory in list(self._checked_dirs):
+            if subtree_relative_suffix(directory, exact_norm, prefix_norm) is not None:
+                self._checked_dirs.discard(directory)
+                checked_removed = True
+        for directory in list(self._dir_rules):
+            if subtree_relative_suffix(directory, exact_norm, prefix_norm) is not None:
+                self._dir_rules.pop(directory, None)
+                rules_removed = True
+        return checked_removed, rules_removed
 
     def _find_root(self, path: Path):
         path_str = os.path.normcase(str(path))
@@ -185,10 +251,10 @@ class GitIgnoreFilter:
                 try:
                     with open(gitignore_file, "r", encoding="utf-8", errors="ignore") as file:
                         for line in file:
-                            line = line.strip()
-                            if not line or line.startswith("#"):
+                            cleaned = self._clean_pattern_line(line)
+                            if cleaned is None:
                                 continue
-                            self._add_rule_to_list(line, rules)
+                            self._add_rule_to_list(cleaned, rules)
                 except OSError:
                     rules = []
 
@@ -202,7 +268,7 @@ class GitIgnoreFilter:
         if is_negated:
             pattern = pattern[1:]
 
-        is_dir_only = pattern.endswith("/")
+        is_dir_only = pattern.endswith("/") and not pattern.endswith("\\/")
         if is_dir_only:
             pattern = pattern[:-1]
 
@@ -216,7 +282,10 @@ class GitIgnoreFilter:
         index = 0
         while index < len(pattern):
             char = pattern[index]
-            if char == "*":
+            if char == "\\" and index + 1 < len(pattern):
+                regex_parts.append(re.escape(pattern[index + 1]))
+                index += 2
+            elif char == "*":
                 if index + 1 < len(pattern) and pattern[index + 1] == "*":
                     if index + 2 < len(pattern) and pattern[index + 2] == "/":
                         # **/ also matches zero directories.
@@ -252,11 +321,10 @@ class GitIgnoreFilter:
                 index += 1
 
         regex_body = "".join(regex_parts)
-        suffix = "(?P<descendant>/.*)?$"
         if anchored:
-            regex_text = "^" + regex_body + suffix
+            regex_text = "^" + regex_body + "$"
         else:
-            regex_text = "(^|.*/)" + regex_body + suffix
+            regex_text = "(^|.*?/)" + regex_body + "$"
 
         try:
             rule_list.append((re.compile(regex_text), is_dir_only, is_negated))
@@ -265,21 +333,16 @@ class GitIgnoreFilter:
 
     @staticmethod
     def _rule_matches(regex, is_dir_only: bool, path: str, is_dir: bool) -> bool:
-        match = regex.match(path)
-        if match is None:
+        if is_dir_only and not is_dir:
             return False
-        if is_dir_only and not is_dir and not match.group("descendant"):
-            # A directory-only rule ignores descendants, but not a regular
-            # file that merely has the same basename as the directory rule.
-            return False
-        return True
+        return regex.match(path) is not None
 
     def _is_ignored_impl(self, path: Path, is_dir: bool = False) -> bool:
         with self._lock:
             # Roots are resolved at construction time. Canonicalize parent
             # directories so macOS aliases such as /var and /private/var remain
             # in the same namespace while preserving symlinks inside the root.
-            resolved_path = self._canonicalize_path(path)
+            resolved_path = path if self._assume_canonical else self._canonicalize_path(path)
             root_path = self._find_root(resolved_path)
             if root_path is None:
                 return True
@@ -289,17 +352,28 @@ class GitIgnoreFilter:
                 # A watched root directory itself must never be ignored.
                 return False
 
-            if self._ignore_common_dirs:
-                for index, part in enumerate(rel_path.parts):
-                    if part in self._fast_ignore_dirs or part.endswith(".egg-info"):
-                        if index < len(rel_path.parts) - 1 or is_dir:
-                            return True
+            # Match Git's top-down directory semantics: once any ancestor
+            # directory is ignored, all descendants stay ignored as well.
+            parent_dir = resolved_path.parent
+            if parent_dir != root_path and self._cached_lookup is not None:
+                prev = self._assume_canonical
+                self._assume_canonical = True
+                try:
+                    if self._cached_lookup(parent_dir, True):
+                        return True
+                finally:
+                    self._assume_canonical = prev
 
-            parent_dir = resolved_path if is_dir else resolved_path.parent
-            self._ensure_gitignore_loaded(parent_dir, root_path=root_path)
+            if self._ignore_common_dirs:
+                last_part = rel_path.parts[-1]
+                if is_dir and (last_part in self._fast_ignore_dirs or last_part.endswith(".egg-info")):
+                    return True
+
+            check_dir = resolved_path if is_dir else parent_dir
+            self._ensure_gitignore_loaded(check_dir, root_path=root_path)
 
             ignored = False
-            current = parent_dir
+            current = check_dir
             applicable_dirs = []
             while True:
                 if current in self._dir_rules:

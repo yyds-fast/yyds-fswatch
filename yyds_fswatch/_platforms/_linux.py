@@ -11,6 +11,7 @@ import asyncio
 from pathlib import Path
 from typing import List, Callable, Dict, Tuple
 
+from ..ignore import path_prefix_pair, subtree_relative_suffix
 from ._base import BaseWatcher
 
 # Load libc
@@ -26,6 +27,11 @@ if not hasattr(libc, "inotify_init") or not hasattr(libc, "inotify_add_watch") o
 inotify_init = libc.inotify_init
 inotify_init.argtypes = []
 inotify_init.restype = ctypes.c_int
+
+inotify_init1 = getattr(libc, "inotify_init1", None)
+if inotify_init1 is not None:
+    inotify_init1.argtypes = [ctypes.c_int]
+    inotify_init1.restype = ctypes.c_int
 
 inotify_add_watch = libc.inotify_add_watch
 inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
@@ -70,20 +76,23 @@ class LinuxWatcher(BaseWatcher):
             recursive_roots=recursive_roots,
         )
         self._fd = -1
+        self._starting = False
+        self._stopping = False
         self._wd_to_path: Dict[int, Path] = {}
         self._path_to_wd: Dict[Path, int] = {}
         self._file_wds = set()
         self._watched_inodes: Dict[Path, Tuple[int, int]] = {}
-        self._buffer = b''
+        self._buffer = bytearray()
         self._move_cookies: Dict[int, Tuple[Path, float, bool, asyncio.TimerHandle]] = {}
         self._ignored_wds_pending = set()
         self._synthesized_creates: Dict[Path, float] = {}
         self._synthesized_prune_handle = None
         self._rebuild_scheduled = False
+        self._reconcile_scheduled = False
 
     @property
     def is_running(self) -> bool:
-        return self._fd >= 0
+        return self._fd >= 0 and not self._stopping
 
     def is_healthy_for(self, paths: List[Path]) -> bool:
         """Check both the inotify instance and coverage of requested roots.
@@ -93,6 +102,8 @@ class LinuxWatcher(BaseWatcher):
         fd alone as healthy leaves a rapidly recreated root permanently
         unwatched.
         """
+        if self._starting and not self._stopping:
+            return True
         if not self.is_running:
             return False
         for path in paths:
@@ -108,60 +119,90 @@ class LinuxWatcher(BaseWatcher):
                 return False
         return True
 
-    def start(self):
-        if self._fd >= 0:
-            raise RuntimeError("Linux watcher is already running")
-        # 1. Initialize inotify instance
-        self._fd = inotify_init()
-        if self._fd < 0:
+    def _open_inotify_fd(self) -> int:
+        cloexec_flag = getattr(os, "O_CLOEXEC", 0x80000)
+        if inotify_init1 is not None:
+            fd = inotify_init1(os.O_NONBLOCK | cloexec_flag)
+            if fd >= 0:
+                return fd
+            err = ctypes.get_errno()
+            if err not in (errno.ENOSYS, errno.EINVAL):
+                raise OSError(err, f"inotify_init1 failed: {os.strerror(err)}")
+
+        fd = inotify_init()
+        if fd < 0:
             err = ctypes.get_errno()
             raise OSError(err, f"inotify_init failed: {os.strerror(err)}")
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        fd_flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        fcntl.fcntl(fd, fcntl.F_SETFD, fd_flags | fcntl.FD_CLOEXEC)
+        return fd
 
-        # Set to non-blocking
-        flags = fcntl.fcntl(self._fd, fcntl.F_GETFL)
-        fcntl.fcntl(self._fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        
-        # Set close-on-exec
-        fd_flags = fcntl.fcntl(self._fd, fcntl.F_GETFD)
-        fcntl.fcntl(self._fd, fcntl.F_SETFD, fd_flags | fcntl.FD_CLOEXEC)
-
-        # 2. Register watches for all paths
+    def _init_and_register(self):
+        if self._fd >= 0:
+            raise RuntimeError("Linux watcher is already running")
+        self._stopping = False
+        self._fd = self._open_inotify_fd()
         try:
             for p in self.paths:
+                if self._stopping:
+                    break
                 if p.exists():
                     self._register_path(p)
-        except Exception as e:
+        except Exception:
             self.stop()
-            raise e
+            raise
 
-        # 3. Add to asyncio loop readers
-        self.loop.add_reader(self._fd, self._handle_raw_read)
+    def start(self):
+        self._init_and_register()
+        if self._fd >= 0 and not self._stopping:
+            self.loop.add_reader(self._fd, self._handle_raw_read)
+
+    async def astart(self):
+        if self.recursive and self._recursive_roots:
+            self._starting = True
+            try:
+                await self._run_in_helper_thread(
+                    self._init_and_register,
+                    "yyds-fswatch-inotify-init",
+                )
+            except BaseException:
+                self.stop()
+                raise
+            finally:
+                self._starting = False
+            if self._fd >= 0 and not self._stopping:
+                self.loop.add_reader(self._fd, self._handle_raw_read)
+        else:
+            self.start()
 
     def stop(self):
+        self._stopping = True
         if self._fd >= 0:
+            fd = self._fd
+            self._fd = -1
             try:
-                self.loop.remove_reader(self._fd)
+                self.loop.remove_reader(fd)
             except Exception:
                 pass
             
             # Remove all watches
             for wd in list(self._wd_to_path.keys()):
                 try:
-                    inotify_rm_watch(self._fd, wd)
+                    inotify_rm_watch(fd, wd)
                 except Exception:
                     pass
             
             try:
-                os.close(self._fd)
+                os.close(fd)
             except Exception:
                 pass
-            
-            self._fd = -1
         self._wd_to_path.clear()
         self._path_to_wd.clear()
         self._file_wds.clear()
         self._watched_inodes.clear()
-        self._buffer = b''
+        self._buffer.clear()
         for _, _, _, timer in self._move_cookies.values():
             timer.cancel()
         self._move_cookies.clear()
@@ -171,6 +212,7 @@ class LinuxWatcher(BaseWatcher):
             self._synthesized_prune_handle = None
         self._synthesized_creates.clear()
         self._rebuild_scheduled = False
+        self._reconcile_scheduled = False
 
     def _record_root_inode(self, path: Path):
         if path in self._watched_roots:
@@ -205,11 +247,25 @@ class LinuxWatcher(BaseWatcher):
                 0.5, self._prune_synthesized_creates
             )
 
-    def _register_path(self, path: Path, emit_existing: bool = False):
+    def _is_path_ignored(self, path: Path, is_dir: bool) -> bool:
+        filt = self._ignore_filter
+        if filt is None:
+            return False
+        ignore_fn = getattr(filt, "is_ignored_canonical", None) or getattr(filt, "is_ignored", None)
+        if ignore_fn is None:
+            return False
+        return bool(ignore_fn(path, is_dir))
+
+    def _register_path(self, path: Path, emit_existing: bool = False,
+                       force_rescan: bool = False):
+        if self._stopping or self._fd < 0:
+            return
         path = path.resolve()
-        if path in self._path_to_wd:
+        if path in self._path_to_wd and not force_rescan:
             return
         if not path.is_dir():
+            if path in self._path_to_wd:
+                return
             # Watch single file
             wd = inotify_add_watch(self._fd, os.fsencode(path), InotifyMask.WATCH_MASK)
             if wd < 0:
@@ -221,7 +277,9 @@ class LinuxWatcher(BaseWatcher):
             self._record_root_inode(path)
             return
 
-        if not self._should_recurse_into(path):
+        if not self._should_recurse_into(path, resolved=True):
+            if path in self._path_to_wd:
+                return
             # Single directory
             wd = inotify_add_watch(self._fd, os.fsencode(path), InotifyMask.WATCH_MASK)
             if wd < 0:
@@ -234,18 +292,31 @@ class LinuxWatcher(BaseWatcher):
 
         # Recursive registration: add inotify watch on each directory BEFORE
         # scanning its children so no created child falls into the race gap.
+        limit_reported = False
         stack = [path]
         while stack:
+            if self._stopping or self._fd < 0:
+                return
             dir_path = stack.pop()
-            if self._ignore_filter and self._ignore_filter.is_ignored(dir_path, is_dir=True):
+            if self._is_path_ignored(dir_path, is_dir=True):
                 continue
 
             if dir_path not in self._path_to_wd:
                 wd = inotify_add_watch(self._fd, os.fsencode(dir_path), InotifyMask.WATCH_MASK)
                 if wd < 0:
                     err = ctypes.get_errno()
-                    if err in (errno.ENOSPC, errno.EMFILE) and not emit_existing:
-                        raise OSError(err, f"inotify watch limit exceeded: {os.strerror(err)}")
+                    if err in (errno.ENOSPC, errno.EMFILE):
+                        exc = OSError(err, f"inotify watch limit exceeded: {os.strerror(err)}")
+                        if not emit_existing and not force_rescan:
+                            raise exc
+                        if not limit_reported:
+                            limit_reported = True
+                            self.on_raw_event("overflow", dir_path, is_dir=False)
+                            if self.loop and not self.loop.is_closed():
+                                self.loop.call_exception_handler({
+                                    "message": "yyds-fswatch inotify watch limit exceeded at runtime",
+                                    "exception": exc,
+                                })
                     continue
                 self._wd_to_path[wd] = dir_path
                 self._path_to_wd[dir_path] = wd
@@ -258,12 +329,14 @@ class LinuxWatcher(BaseWatcher):
                 with os.scandir(dir_path) as entries:
                     subdirs = []
                     for entry in entries:
+                        if self._stopping or self._fd < 0:
+                            return
                         try:
                             entry_is_dir = entry.is_dir(follow_symlinks=False)
                         except OSError:
                             continue
                         entry_path = dir_path / entry.name
-                        if self._ignore_filter and self._ignore_filter.is_ignored(entry_path, is_dir=entry_is_dir):
+                        if self._is_path_ignored(entry_path, is_dir=entry_is_dir):
                             continue
                         if entry_is_dir:
                             subdirs.append(entry_path)
@@ -275,13 +348,50 @@ class LinuxWatcher(BaseWatcher):
             except OSError:
                 continue
 
+    def reconcile_watches(self):
+        """Schedule watch reconciliation after ignore rules change."""
+        if not self.is_running or not self.recursive or not self._recursive_roots:
+            return
+        if self.loop is not None and self.loop.is_running():
+            if not self._reconcile_scheduled:
+                self._reconcile_scheduled = True
+                self.loop.call_soon(self._reconcile_watches_now)
+            return
+        self._reconcile_watches_now()
+
+    def _reconcile_watches_now(self):
+        self._reconcile_scheduled = False
+        if not self.is_running or not self.recursive or not self._recursive_roots:
+            return
+        if self._ignore_filter is not None:
+            for watched_path in list(self._path_to_wd):
+                if watched_path in self._watched_roots:
+                    continue
+                if watched_path not in self._path_to_wd:
+                    continue
+                if self._is_path_ignored(watched_path, is_dir=True):
+                    self._remove_watch_subtree(watched_path)
+
+        for p in self.paths:
+            if self._stopping or self._fd < 0:
+                break
+            if p.exists() and self._should_recurse_into(p):
+                try:
+                    self._register_path(p, emit_existing=False, force_rescan=True)
+                except Exception:
+                    pass
+
     def _handle_raw_read(self):
-        while True:
+        # Bound per-callback reads to 1 MiB so an uninterrupted kernel event
+        # storm cannot starve other coroutines or prevent stop() from running.
+        for _ in range(16):
+            if self._fd < 0:
+                return
             try:
                 data = os.read(self._fd, 65536)
                 if not data:
                     break
-                self._buffer += data
+                self._buffer.extend(data)
             except BlockingIOError:
                 break
             except OSError as exc:
@@ -295,22 +405,26 @@ class LinuxWatcher(BaseWatcher):
 
         offset = 0
         header_size = 16  # wd(4) + mask(4) + cookie(4) + len(4)
+        buf_len = len(self._buffer)
 
-        while offset + header_size <= len(self._buffer):
+        while offset + header_size <= buf_len:
+            if self._fd < 0:
+                return
             wd, mask, cookie, name_len = struct.unpack_from('iIII', self._buffer, offset)
             total_len = header_size + name_len
 
-            if offset + total_len > len(self._buffer):
+            if offset + total_len > buf_len:
                 break  # Incomplete event, wait for more data
 
             # Extract name and strip padding nulls
-            name_bytes = self._buffer[offset + header_size : offset + total_len]
+            name_bytes = bytes(self._buffer[offset + header_size : offset + total_len])
             name = os.fsdecode(name_bytes.rstrip(b'\x00'))
 
             self._dispatch_event(wd, mask, cookie, name)
             offset += total_len
 
-        self._buffer = self._buffer[offset:]
+        if offset and self._fd >= 0:
+            del self._buffer[:offset]
 
     def _dispatch_event(self, wd: int, mask: int, cookie: int, name: str):
         if mask & InotifyMask.IN_Q_OVERFLOW:
@@ -444,25 +558,29 @@ class LinuxWatcher(BaseWatcher):
                 self._remove_watch_subtree(old_path)
 
     def _rename_watch_subtree(self, old_path: Path, new_path: Path):
+        exact_norm, prefix_norm = path_prefix_pair(old_path)
         replacements = []
         for watched_path, wd in list(self._path_to_wd.items()):
-            try:
-                relative = watched_path.relative_to(old_path)
-            except ValueError:
+            suffix = subtree_relative_suffix(watched_path, exact_norm, prefix_norm)
+            if suffix is None:
                 continue
-            replacements.append((watched_path, new_path / relative, wd))
+            dest = new_path / suffix if suffix else new_path
+            replacements.append((watched_path, dest, wd))
 
         for watched_path, new_watched_path, wd in replacements:
             self._path_to_wd.pop(watched_path, None)
+            prev_wd = self._path_to_wd.get(new_watched_path)
+            if prev_wd is not None and prev_wd != wd:
+                self._wd_to_path.pop(prev_wd, None)
+                self._file_wds.discard(prev_wd)
             self._path_to_wd[new_watched_path] = wd
             self._wd_to_path[wd] = new_watched_path
 
     def _remove_watch_subtree(self, path: Path):
+        exact_norm, prefix_norm = path_prefix_pair(path)
         watches = []
         for watched_path, wd in list(self._path_to_wd.items()):
-            try:
-                watched_path.relative_to(path)
-            except ValueError:
+            if subtree_relative_suffix(watched_path, exact_norm, prefix_norm) is None:
                 continue
             watches.append((watched_path, wd))
 
@@ -475,10 +593,24 @@ class LinuxWatcher(BaseWatcher):
                 self._ignored_wds_pending.add(wd)
                 inotify_rm_watch(self._fd, wd)
 
+    async def _arebuild_watches(self):
+        try:
+            self.stop()
+            await self.astart()
+        except Exception as exc:
+            self.loop.call_exception_handler({
+                "message": "yyds-fswatch failed to rebuild inotify watches after overflow",
+                "exception": exc,
+            })
+
     def _rebuild_watches(self):
         """Reconcile recursive watches after the kernel queue overflowed."""
         self._rebuild_scheduled = False
-        if self._fd < 0:
+        self._reconcile_scheduled = False
+        if self._fd < 0 or self._stopping:
+            return
+        if self.loop and self.loop.is_running():
+            self.loop.create_task(self._arebuild_watches())
             return
         try:
             # Recreate the inotify instance rather than reusing watch
